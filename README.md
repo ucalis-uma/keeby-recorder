@@ -217,3 +217,24 @@ SMALL（短い動画・テスト用URL）を選ぶと artifact も小さく済�
 > そのため短い通常動画をテストURLに使える。なお YouTube 側のコメント取得
 > （`--write-comments`）はライブ以外では空になる場合があるが、
 > 動画DLの成否確認には影響しない。
+
+---
+
+## 11. ドライラン失敗時の調査（yt-dlp 終了コード1）
+
+テスト実行で `[動画DL] 終了 (コード: 1)` → `ダウンロードファイルが0バイト` になった場合、
+以前は yt-dlp の stderr を破棄していたため原因が特定できなかった。現在は以下を保存している：
+
+- `recorder.log` に `CMD:`（実行コマンド全文）と `yt-dlp stderr末尾`（最大30行）を転記
+- artifact `recorder-logs` に `ytdlp-video-stdout.log` / `ytdlp-video-stderr.log`
+  （再試行時は `ytdlp-video-retry-*.log`、コメント取得は `ytdlp-comment-*.log`）全文
+- Twitch 側も同様（`twitch-recorder-logs` に `ytdlp-twitch-*.log`）
+
+よくある原因と対処：
+
+| stderr の内容 | 意味 | 対処 |
+|---|---|---|
+| `Requested format is not available` | `-f` 指定の mp4/m4a ペアが無い（Shorts 等） | 自動で `bv*+ba/b` に緩めて再試行する（手動対応不要） |
+| `Sign in to confirm you're not a bot` / `403` | YouTube の bot 検出 | `COOKIES_TXT` Secret を登録して再実行 |
+| `Private video` / `Video unavailable` | 非公開・削除済み・地域制限 | 別の公開動画URLで再テスト |
+| `Age-restricted` | 年齢制限（ログイン必須） | `COOKIES_TXT` 登録が必要。それでも不可なら別URLで再テスト |

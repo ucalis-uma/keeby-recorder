@@ -224,17 +224,59 @@ def check_live_status(api_manager, target_channel_id):
 # ============================================================
 # ウォッチドッグ付きダウンロード実行
 # ============================================================
+def _log_stderr_tail(stderr_path, label):
+    """yt-dlp の stderr 末尾をログに出す（失敗原因の特定用）。"""
+    try:
+        with open(stderr_path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        logger.error(f"[{label}] stderr読取失敗 ({stderr_path}): {e}")
+        return
+    tail = "\n".join(lines[-30:])
+    if tail:
+        logger.error(f"[{label}] yt-dlp stderr末尾:\n{tail}")
+    else:
+        logger.error(f"[{label}] stderr が空でした ({stderr_path})")
+
+
 def run_with_watchdog(command, watch_dir, label="process", max_seconds=0):
     """
     子プロセスを起動し、watch_dir のサイズを定期監視。
     STALL_TIMEOUT 秒間サイズが変化しなければプロセスを強制終了（配信終了とみなす）。
     旧VPS版と同一ロジック。max_seconds > 0 のときはテスト用にその秒数で打ち切る。
     戻り値: プロセス終了コード（停滞打ち切り時は -1、時間打ち切り時は -2）。
+    yt-dlp の stdout/stderr は LOG_DIR/ytdlp-<label>-*.log に保存し、
+    失敗時は stderr 末尾をこのログにも転記する（原因特定用）。
     """
-    proc = subprocess.Popen(command, start_new_session=True)
+    import re
+
+    safe_label = {"動画DL": "video", "動画DL再試行": "video-retry"}.get(
+        label, re.sub(r"[^A-Za-z0-9_-]+", "_", label)
+    )
+    stdout_path = os.path.join(LOG_DIR, f"ytdlp-{safe_label}-stdout.log")
+    stderr_path = os.path.join(LOG_DIR, f"ytdlp-{safe_label}-stderr.log")
+    logger.info(f"[{label}] CMD: {' '.join(command)}")
+    f_out = open(stdout_path, "w", encoding="utf-8", errors="replace")
+    f_err = open(stderr_path, "w", encoding="utf-8", errors="replace")
+    try:
+        proc = subprocess.Popen(command, stdout=f_out, stderr=f_err, start_new_session=True)
+    except Exception:
+        f_out.close()
+        f_err.close()
+        raise
     logger.info(f"[{label}] PID {proc.pid} (PGID {os.getpgid(proc.pid)}) で開始")
     if max_seconds > 0:
         logger.info(f"[{label}] テストモード: {max_seconds}秒で打ち切ります。")
+
+    def _close_logs():
+        try:
+            f_out.close()
+        except Exception:
+            pass
+        try:
+            f_err.close()
+        except Exception:
+            pass
 
     last_size = get_dir_size(watch_dir)
     last_change_time = time.time()
@@ -259,6 +301,7 @@ def run_with_watchdog(command, watch_dir, label="process", max_seconds=0):
                     proc.wait()
                 except ProcessLookupError:
                     pass
+            _close_logs()
             return -2
         current_size = get_dir_size(watch_dir)
 
@@ -299,6 +342,7 @@ def run_with_watchdog(command, watch_dir, label="process", max_seconds=0):
                             pass
                     except ProcessLookupError:
                         pass
+                _close_logs()
                 return -1
             elif stall_seconds >= 300:
                 logger.info(
@@ -307,6 +351,9 @@ def run_with_watchdog(command, watch_dir, label="process", max_seconds=0):
                 )
 
     logger.info(f"[{label}] 終了 (コード: {proc.returncode})")
+    _close_logs()
+    if proc.returncode not in (0, None):
+        _log_stderr_tail(stderr_path, label)
     return proc.returncode
 
 
@@ -352,13 +399,21 @@ def execute_scripts(live_url, cookies_file=None):
     os.makedirs(COMMENTS_DIR, exist_ok=True)
 
     # --- コメント取得をバックグラウンドで開始 ---
-    comment_cmd = [YT_DLP_BIN, "--write-comments", "--skip-download", "--add-metadata"]
+    # 出力は LOG_DIR に保存し、失敗時は末尾を転記する（動画DLと同様）。
+    comment_cmd = [YT_DLP_BIN, "--write-comments", "--skip-download", "--add-metadata",
+                   "--no-playlist"]
     if cookies_file:
         comment_cmd += ["--cookies", cookies_file]
     comment_cmd += ["-o", os.path.join(COMMENTS_DIR, "%(title)s [%(id)s].%(ext)s"), live_url]
 
     logger.info("コメント取得を開始...")
-    comment_proc = subprocess.Popen(comment_cmd, start_new_session=True)
+    comment_stdout_path = os.path.join(LOG_DIR, "ytdlp-comment-stdout.log")
+    comment_stderr_path = os.path.join(LOG_DIR, "ytdlp-comment-stderr.log")
+    comment_f_out = open(comment_stdout_path, "w", encoding="utf-8", errors="replace")
+    comment_f_err = open(comment_stderr_path, "w", encoding="utf-8", errors="replace")
+    comment_proc = subprocess.Popen(
+        comment_cmd, stdout=comment_f_out, stderr=comment_f_err, start_new_session=True
+    )
 
     # --- 動画ダウンロード（ウォッチドッグ付き） ---
     # テスト時は通常の動画URLでも落とせるよう --live-from-start を外す（本番は付与）。
@@ -370,6 +425,7 @@ def execute_scripts(live_url, cookies_file=None):
         "--retries", "infinite",
         "--fragment-retries", "infinite",
         "--socket-timeout", "30",
+        "--no-playlist",
         "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "-o", os.path.join(DOWNLOAD_DIR, "%(title)s [%(id)s].%(ext)s"),
     ]
@@ -380,6 +436,22 @@ def execute_scripts(live_url, cookies_file=None):
     video_exit = run_with_watchdog(
         video_cmd, DOWNLOAD_DIR, label="動画DL", max_seconds=TEST_MAX_SECONDS
     )
+
+    # --- 厳格フォーマットで失敗したら緩い指定で1回だけ再試行 ---
+    # Shorts 等で mp4/m4a ペアが存在しない場合の救済。テスト打ち切り(-2)・
+    # 停滞打ち切り(-1)・正常終了(0)の場合は再試行しない。
+    if video_exit not in (0, -1, -2) and get_dir_size(DOWNLOAD_DIR) == 0:
+        logger.warning(
+            f"動画DLがコード {video_exit} で失敗。フォーマット指定を緩めて再試行します。"
+        )
+        retry_cmd = [c for c in video_cmd if c != "--live-from-start"]
+        for i, c in enumerate(retry_cmd):
+            if c == "-f":
+                retry_cmd[i + 1] = "bv*+ba/b"
+                break
+        video_exit = run_with_watchdog(
+            retry_cmd, DOWNLOAD_DIR, label="動画DL再試行", max_seconds=TEST_MAX_SECONDS
+        )
 
     # --- 動画DL終了後にコメントDLも終了させる ---
     logger.info("動画DLが終了。コメント取得プロセスを終了...")
@@ -398,6 +470,15 @@ def execute_scripts(live_url, cookies_file=None):
         pass
     except Exception as e:
         logger.warning(f"コメント終了処理でエラー: {e}")
+    finally:
+        try:
+            comment_f_out.close()
+        except Exception:
+            pass
+        try:
+            comment_f_err.close()
+        except Exception:
+            pass
 
     # --- アップロード前の結合保険 ---
     dl_size = get_dir_size(DOWNLOAD_DIR)

@@ -151,11 +151,23 @@ def record_and_upload(with_chat=True, target_url=None, max_seconds=0):
 
     # --- A. 動画DL ---
     # テスト時は通常の動画URLでも落とせるよう --live-from-start を外す（本番は付与）。
+    # yt-dlp の stdout/stderr は LOG_DIR に保存し、失敗時は末尾を転記する
+    # （YouTube 側の test で終了コード1の原因が残らず特定不能だった反省）。
     video_cmd = [YT_DLP_BIN]
     if not TEST_TARGET_URL:
         video_cmd.append("--live-from-start")
     video_cmd += ["-o", video_pattern, target_url]
-    p_video = subprocess.Popen(video_cmd)
+    logger.info(f"CMD: {' '.join(video_cmd)}")
+    video_stdout_path = os.path.join(LOG_DIR, "ytdlp-twitch-stdout.log")
+    video_stderr_path = os.path.join(LOG_DIR, "ytdlp-twitch-stderr.log")
+    f_out = open(video_stdout_path, "w", encoding="utf-8", errors="replace")
+    f_err = open(video_stderr_path, "w", encoding="utf-8", errors="replace")
+    try:
+        p_video = subprocess.Popen(video_cmd, stdout=f_out, stderr=f_err)
+    except Exception:
+        f_out.close()
+        f_err.close()
+        raise
 
     # --- B. チャットDL（chat_downloader があれば） ---
     p_chat = None
@@ -200,6 +212,26 @@ def record_and_upload(with_chat=True, target_url=None, max_seconds=0):
                 except subprocess.TimeoutExpired:
                     p_video.kill()
                 break
+
+    video_code = p_video.poll()
+    try:
+        f_out.close()
+    except Exception:
+        pass
+    try:
+        f_err.close()
+    except Exception:
+        pass
+    if video_code not in (0, None):
+        try:
+            with open(video_stderr_path, encoding="utf-8", errors="replace") as f:
+                tail = "\n".join(f.read().splitlines()[-30:])
+        except OSError as e:
+            tail = f"(stderr読取失敗: {e})"
+        if tail:
+            logger.error(f"yt-dlp stderr末尾 (code={video_code}):\n{tail}")
+        else:
+            logger.error(f"yt-dlp stderr が空でした (code={video_code})。")
 
     # --- チャット停止 ---
     if p_chat is not None:
