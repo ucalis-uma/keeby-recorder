@@ -1,0 +1,16 @@
+# 日本語・韓国語などのUTF-8を正しく扱うため、全テキストをUTF-8固定にする。
+# （Windows実行环境和Linux実行環境が混在するためLFで統一）
+* text=auto eol=lf
+
+*.py  text eol=lf diff=python
+*.sh  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+
+# 二進ファイルとして扱う
+*.mp4  binary
+*.webp binary
+*.json binary
+*.jpg  binary
+*.png  binary

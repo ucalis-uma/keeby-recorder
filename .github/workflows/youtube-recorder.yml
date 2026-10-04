@@ -1,0 +1,79 @@
+name: YouTube Live Recorder
+
+# ============================================================
+# Keeby YouTube Live Recorder（GitHub Actions版）
+#
+# 旧Xserver VPS（終了）の代わりに、GitHub Actionsのcronで
+# 「ライブ検知 → 録画 → Google Driveへアップロード」を1回のjobで完結させる。
+#
+# 設計上のポイント:
+#   * 15分間隔で起動。毎回1回だけ生存チェックしライブ中なら録画、なければ即終了。
+#   * cronの「:00」は実行が集中して遅延・dropが起きやすいため、意図的にずらしている。
+#   * timeout-minutes はActionsの6時間上限に少し余裕を持たせて350分(=約5.8時間)。
+#     （ユーザー前提: 1回のライブは6時間未満）
+#   * 自分のPCの電源が入っていなくても GitHub側のランナーが実行する。
+#   * public repo なので標準ランナーは無料・無制限・支払い方法登録も不要。
+# ============================================================
+
+on:
+  schedule:
+    # 15分間隔（毎時0分は避ける: 分5,20,35,50）
+    - cron: '5,20,35,50 * * *'
+  # 手動実行（初回テスト用）
+  workflow_dispatch:
+
+# 同時実行させない（前の録画中に次のcronが走って二重録画＆runner枠の消費を防ぐ）
+concurrency:
+  group: youtube-recorder
+  cancel-in-progress: false
+
+jobs:
+  record:
+    # public repo なので標準ランナーが無料・無制限（4 vCPU / 16GB RAM / 14GB SSD）
+    runs-on: ubuntu-latest
+    # Actionsのjob実行時間上限（6時間）に少し余裕を持たせる
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup dependencies
+        run: bash setup_dependencies.sh
+
+      - name: Setup rclone (Google Drive)
+        env:
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+        run: bash setup_rclone.sh
+
+      - name: Write cookies.txt (if secret exists)
+        # cookies.txt は YouTube の 403 対策に使用する。Secret 未設定でも動くようにする。
+        env:
+          COOKIES_TXT: ${{ secrets.COOKIES_TXT }}
+        run: |
+          if [ -n "${COOKIES_TXT:-}" ]; then
+            printf '%s' "${COOKIES_TXT}" > "$HOME/cookies.txt"
+            echo "cookies.txt written."
+          else
+            echo "COOKIES_TXT not set. Continuing without cookies."
+          fi
+
+      - name: Run recorder
+        env:
+          YOUTUBE_API_KEYS: ${{ secrets.YOUTUBE_API_KEYS }}
+          RCLONE_REMOTE: ${{ vars.RCLONE_REMOTE }}
+          GDRIVE_VIDEO_DEST: ${{ vars.GDRIVE_VIDEO_DEST }}
+          GDRIVE_COMMENT_DEST: ${{ vars.GDRIVE_COMMENT_DEST }}
+          YT_DLP_BIN: /usr/local/bin/yt-dlp
+          RCLONE_BIN: /usr/local/bin/rclone
+          KEEBY_BASE_DIR: ${{ github.workspace }}
+          LOG_DIR: ${{ github.workspace }}/logs
+        run: python3 recorder.py
+      - name: Upload logs (for debugging)
+        # 録画自体には不要だが、失敗時の調査用。artifact は小さいので問題なし。
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recorder-logs
+          path: ${{ github.workspace }}/logs
+          retention-days: 7

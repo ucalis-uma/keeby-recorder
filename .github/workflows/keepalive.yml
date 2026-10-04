@@ -1,0 +1,38 @@
+name: Keep Alive
+
+# ============================================================
+# 60日ルール対策
+#
+# GitHubのルール: **public リポジトリは 60 日間アクティビティが無いと、
+# scheduled workflows が自動的に disable される**（公式ドキュメント明記）。
+# つまり何もしなければ、2ヶ月後に録画が黙って止まってしまう。
+#
+# そこで毎日1回ノイズのない commit（allow-empty の空コミット）をpushして
+# アクティビティを発生させ、scheduleを稼働させ続ける。
+# 変更ファイルはゼロなので差分は出ない（＝実質的な変更はゼロ）。
+# ============================================================
+
+on:
+  schedule:
+    # 毎日 3:12 に実行（`:00` を避けて遅延规避）
+    - cron: '12 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    # 実行は空コミットの push だけなので短くてよい。timeout は最小に。
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create empty keepalive commit
+        run: |
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keep-alive (prevent 60-day schedule disable)"
+          git push

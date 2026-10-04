@@ -1,0 +1,70 @@
+name: Twitch Live Recorder
+
+# ============================================================
+# Keeby Twitch Live Recorder（GitHub Actions版）
+#
+# 旧Xserver VPS（終了）の代わりに、GitHub Actionsのcronで
+# 「配信検知 → 録画＋チャット保存 → Google Driveへアップロード」を1回のjobで完結させる。
+#
+# 設計上のポイント:
+#   * 15分間隔で起動。毎回1回だけ生存チェックし配信中なら録画、なければ即終了。
+#   * YouTube側と時刻をずらしたcronにして、両方同時に走らないようにしている。
+#   * timeout-minutes はActionsの6時間上限に少し余裕を持たせて350分(約5.8時間)。
+#   * public repo なので標準ランナーは無料・無制限・支払い方法登録も不要。
+# ============================================================
+
+on:
+  schedule:
+    # 15分間隔（毎時0分は避ける / YouTube側とずらす: 分 12,27,42,57）
+    - cron: '12,27,42,57 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: twitch-recorder
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup dependencies
+        run: bash setup_dependencies.sh
+
+      - name: Setup rclone (Google Drive)
+        env:
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+        run: bash setup_rclone.sh
+
+      - name: Run recorder
+        env:
+          TWITCH_STREAMER_ID: ${{ vars.TWITCH_STREAMER_ID }}
+          RCLONE_REMOTE: ${{ vars.RCLONE_REMOTE }}
+          GDRIVE_TWITCH_DEST: ${{ vars.GDRIVE_TWITCH_DEST }}
+          YT_DLP_BIN: /usr/local/bin/yt-dlp
+          RCLONE_BIN: /usr/local/bin/rclone
+          CHAT_DOWNLOADER_BIN: ${{ github.workspace }}/.venv-twitch/bin/chat_downloader
+          KEEBY_BASE_DIR: ${{ github.workspace }}
+          LOG_DIR: ${{ github.workspace }}/logs
+        run: |
+          set -euo pipefail
+          # chat_downloader は setup_dependencies.sh の pip install --user で入るが、
+          # GitHub Actions では pip の target が環境によって変わるため、
+          # 確実にパスを解決できるよう venv を作って明示的にパスを取る。
+          python3 -m venv .venv-twitch
+          .venv-twitch/bin/pip install --upgrade pip
+          .venv-twitch/bin/pip install chat-downloader
+          .venv-twitch/bin/python -c "import chat_downloader; print('chat_downloader OK')"
+          python3 twitch_recorder.py
+
+      - name: Upload logs (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: twitch-recorder-logs
+          path: ${{ github.workspace }}/logs
+          retention-days: 7

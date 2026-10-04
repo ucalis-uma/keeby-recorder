@@ -1,0 +1,24 @@
+# --- 録画データ: GitHub Actionsには保存できないので、rclone で Google Drive へアップロードする ---
+downloads/
+comments/
+twitch_temp/
+logs/
+*.part
+*.ytdl
+
+# --- 認証情報は絶対にコミットしない（公開リポジトリになるため重要） ---
+cookies.txt
+rclone.conf
+*.cookie
+service_account*.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+.venv-twitch/
+*.egg-info/
+
+# --- その他 ---
+.DS_Store
+Thumbs.db
