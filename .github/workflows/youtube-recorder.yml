@@ -68,7 +68,9 @@ jobs:
           GDRIVE_VIDEO_DEST: ${{ vars.GDRIVE_VIDEO_DEST }}
           GDRIVE_COMMENT_DEST: ${{ vars.GDRIVE_COMMENT_DEST }}
           YT_DLP_BIN: /usr/local/bin/yt-dlp
-          RCLONE_BIN: /usr/local/bin/rclone
+          # rclone の実体は installer 任せ（/usr/bin 配下になる場合あり）のため
+          # PATH 解決に任せる。setup_rclone.sh の `rclone listremotes` と同じ解決になる。
+          RCLONE_BIN: rclone
           KEEBY_BASE_DIR: ${{ github.workspace }}
           LOG_DIR: ${{ github.workspace }}/logs
           COOKIES_FILE: ${{ github.workspace }}/cookies.txt

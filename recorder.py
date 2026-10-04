@@ -283,7 +283,11 @@ def run_with_watchdog(command, watch_dir, label="process"):
 def upload_with_rclone(cmd):
     """rclone アップロード。失敗しても例外を投げずログのみ（jobは失敗させない）。"""
     logger.info(f"rclone: {' '.join(cmd)}")
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except FileNotFoundError:
+        logger.warning(f"rclone が見つかりません（{cmd[0]}）。アップロードをスキップします。")
+        return
     if res.returncode != 0:
         out = res.stdout.decode("utf-8", errors="replace")[-2000:] if res.stdout else "(none)"
         logger.warning(f"rclone が失敗 (コード: {res.returncode})。出力: {out}")

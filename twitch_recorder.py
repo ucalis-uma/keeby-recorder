@@ -101,10 +101,19 @@ def cleanup_dir(path):
 
 def upload_to_drive():
     """OUTPUT_DIR を Google Drive へアップロード。成功時のみローカル削除。"""
+    import shutil as _shutil
+
+    if _shutil.which(RCLONE_BIN) is None:
+        logger.warning(f"rclone が見つかりません（{RCLONE_BIN}）。アップロードをスキップします。")
+        return False
     time.sleep(3)  # rclone がファイルを確定するのを待つ
     cmd = [RCLONE_BIN, "copy", OUTPUT_DIR, GDRIVE_TWITCH_DEST, "--drive-chunk-size=64M"]
     logger.info(f"Google Driveへアップロード: {' '.join(cmd)}")
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except FileNotFoundError:
+        logger.warning(f"rclone が見つかりません（{RCLONE_BIN}）。アップロードをスキップします。")
+        return False
     if res.returncode == 0:
         logger.info("アップロード完了。ローカルファイルを削除します。")
         cleanup_dir(OUTPUT_DIR)

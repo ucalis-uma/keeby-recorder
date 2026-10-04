@@ -181,5 +181,6 @@ python check_all.py
 | 4 | `recorder.py` の `format_bytes` 未定義・`datetime` が `if __name__` 内遅延 import のみ | `format_bytes` を追加（旧VPS版と同一ロジック）、`from datetime import datetime` を冒頭に移動。`check_all.py` に必須名検査を追加 |
 | 5 | Twitch 側が `setup_dependencies.sh` と workflow 内で二重に venv/`chat-downloader` を導入 | `requirements.txt` に `chat-downloader` を集約し `.venv` 一本化。workflow 側の `.venv-twitch` 作成手順を削除 |
 | 6 | workflow が `cookies.txt` を `$HOME` に書くのに `recorder.py` へパスを渡していない（`COOKIES_FILE` 未配線） | workspace 直下に書き出し、`COOKIES_FILE` 環境変数で明示的に渡す。存在しない場合は警告して Cookie なしで継続 |
+| 7 | `RCLONE_BIN` を `/usr/local/bin/rclone` に固定していたが rclone installer は `/usr/bin` に置く場合があり `FileNotFoundError` の恐れ | `RCLONE_BIN: rclone` にして PATH 解決に任せる（`setup_rclone.sh` の `rclone listremotes` と同じ解決）。Python 側も `FileNotFoundError` を捕捉して警告のみで継続 |
 
 その他：yt-dlp の安定版→nightly 二重取得を nightly 1回に整理、Deno 導入は `sudo env DENO_INSTALL=...` 方式に変更（`sudo` の `env_reset` 対策）、rclone 導入は先にダウンロードしてから `sudo bash` する方式に変更。

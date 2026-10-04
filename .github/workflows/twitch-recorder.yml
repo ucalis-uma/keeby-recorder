@@ -49,7 +49,9 @@ jobs:
           RCLONE_REMOTE: ${{ vars.RCLONE_REMOTE }}
           GDRIVE_TWITCH_DEST: ${{ vars.GDRIVE_TWITCH_DEST }}
           YT_DLP_BIN: /usr/local/bin/yt-dlp
-          RCLONE_BIN: /usr/local/bin/rclone
+          # rclone の実体は installer 任せ（/usr/bin 配下になる場合あり）のため
+          # PATH 解決に任せる。setup_rclone.sh の `rclone listremotes` と同じ解決になる。
+          RCLONE_BIN: rclone
           CHAT_DOWNLOADER_BIN: ${{ github.workspace }}/.venv/bin/chat_downloader
           KEEBY_BASE_DIR: ${{ github.workspace }}
           LOG_DIR: ${{ github.workspace }}/logs
