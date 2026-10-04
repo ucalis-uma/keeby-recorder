@@ -18,7 +18,8 @@ name: YouTube Live Recorder
 on:
   schedule:
     # 15分間隔（毎時0分は避ける: 分5,20,35,50）
-    - cron: '5,20,35,50 * * *'
+    # GitHub Actionsのcronは5フィールド必須（分 時 日 月 曜日）
+    - cron: '5,20,35,50 * * * *'
   # 手動実行（初回テスト用）
   workflow_dispatch:
 
@@ -48,11 +49,13 @@ jobs:
 
       - name: Write cookies.txt (if secret exists)
         # cookies.txt は YouTube の 403 対策に使用する。Secret 未設定でも動くようにする。
+        # workspace 直下に置き、次の step へ COOKIES_FILE で明示的に渡す
+        # （$HOME に置くと Run recorder 側でパス解決が曖昧になるため）。
         env:
           COOKIES_TXT: ${{ secrets.COOKIES_TXT }}
         run: |
           if [ -n "${COOKIES_TXT:-}" ]; then
-            printf '%s' "${COOKIES_TXT}" > "$HOME/cookies.txt"
+            printf '%s' "${COOKIES_TXT}" > "${{ github.workspace }}/cookies.txt"
             echo "cookies.txt written."
           else
             echo "COOKIES_TXT not set. Continuing without cookies."
@@ -68,7 +71,11 @@ jobs:
           RCLONE_BIN: /usr/local/bin/rclone
           KEEBY_BASE_DIR: ${{ github.workspace }}
           LOG_DIR: ${{ github.workspace }}/logs
-        run: python3 recorder.py
+          COOKIES_FILE: ${{ github.workspace }}/cookies.txt
+        # setup_dependencies.sh が作った .venv の Python を使う
+        # （PEP 668 のためシステム pip は使わない）。
+        # COOKIES_FILE が存在しない場合 recorder.py 側で警告して継続する。
+        run: .venv/bin/python recorder.py
       - name: Upload logs (for debugging)
         # 録画自体には不要だが、失敗時の調査用。artifact は小さいので問題なし。
         if: always()

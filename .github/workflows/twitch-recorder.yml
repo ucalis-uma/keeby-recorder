@@ -16,7 +16,8 @@ name: Twitch Live Recorder
 on:
   schedule:
     # 15分間隔（毎時0分は避ける / YouTube側とずらす: 分 12,27,42,57）
-    - cron: '12,27,42,57 * * *'
+    # GitHub Actionsのcronは5フィールド必須（分 時 日 月 曜日）
+    - cron: '12,27,42,57 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -41,25 +42,18 @@ jobs:
         run: bash setup_rclone.sh
 
       - name: Run recorder
+        # setup_dependencies.sh が .venv を作り requirements.txt
+        # （chat-downloader 含む）を入れ済み。二重 venv は作らず .venv を使用。
         env:
           TWITCH_STREAMER_ID: ${{ vars.TWITCH_STREAMER_ID }}
           RCLONE_REMOTE: ${{ vars.RCLONE_REMOTE }}
           GDRIVE_TWITCH_DEST: ${{ vars.GDRIVE_TWITCH_DEST }}
           YT_DLP_BIN: /usr/local/bin/yt-dlp
           RCLONE_BIN: /usr/local/bin/rclone
-          CHAT_DOWNLOADER_BIN: ${{ github.workspace }}/.venv-twitch/bin/chat_downloader
+          CHAT_DOWNLOADER_BIN: ${{ github.workspace }}/.venv/bin/chat_downloader
           KEEBY_BASE_DIR: ${{ github.workspace }}
           LOG_DIR: ${{ github.workspace }}/logs
-        run: |
-          set -euo pipefail
-          # chat_downloader は setup_dependencies.sh の pip install --user で入るが、
-          # GitHub Actions では pip の target が環境によって変わるため、
-          # 確実にパスを解決できるよう venv を作って明示的にパスを取る。
-          python3 -m venv .venv-twitch
-          .venv-twitch/bin/pip install --upgrade pip
-          .venv-twitch/bin/pip install chat-downloader
-          .venv-twitch/bin/python -c "import chat_downloader; print('chat_downloader OK')"
-          python3 twitch_recorder.py
+        run: .venv/bin/python twitch_recorder.py
 
       - name: Upload logs (for debugging)
         if: always()

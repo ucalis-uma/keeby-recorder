@@ -184,7 +184,10 @@ def main():
         logger.info("配信していません。何もしないで終了します。")
         return
 
-    have_chat = os.path.exists(CHAT_DOWNLOADER_BIN)
+    have_chat = (
+        os.path.isfile(CHAT_DOWNLOADER_BIN)
+        and os.access(CHAT_DOWNLOADER_BIN, os.X_OK)
+    )
     if not have_chat:
         logger.warning(f"{CHAT_DOWNLOADER_BIN} が見つかりません。チャット保存なしで続行。")
 

@@ -21,10 +21,8 @@ sudo apt-get install -y \
   ca-certificates
 
 echo "[INFO] === yt-dlp（nightly）を /usr/local/bin へ ==="
-sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-  -o /usr/local/bin/yt-dlp
-sudo chmod a+rx /usr/local/bin/yt-dlp
-# 実行時に version チェックが走るため git を要求されるAnnual版を使う
+# 安定版→nightly の二重取得は不要。nightly を1回だけ取得する。
+# （YouTube の仕様変更追従のため nightly を常用）
 sudo curl -L https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp \
   -o /usr/local/bin/yt-dlp
 sudo chmod a+rx /usr/local/bin/yt-dlp
@@ -32,31 +30,36 @@ sudo chmod a+rx /usr/local/bin/yt-dlp
 
 echo "[INFO] === Deno（JSランタイム）を /usr/local/bin へ ==="
 # 2025年11月以降、YouTube の対応にJSランタイムが必須になる。
-# yt-dlp が deno / node を自動検出する。Deno公式インストーラを root で実行し、
-# /usr/local/bin に配置して PATH を汚さない。
-curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -y
+# yt-dlp が deno / node を自動検出する。/usr/local への書き込みには root 権限が
+# 必要なため、sudo 側に DENO_INSTALL を渡す（sudo の env_reset 対策で env 経由）。
+curl -fsSL https://deno.land/install.sh | sudo env DENO_INSTALL=/usr/local sh -s -- -y
+export PATH="/usr/local/bin:$PATH"
 command -v deno && deno --version
 
 echo "[INFO] === rclone を /usr/local/bin へ ==="
-curl https://rclone.org/install.sh | sudo bash
+# `curl | sudo bash` は sudo の secure_path 環境で curl が見えない場合があるため、
+# 先にダウンロードしてから sudo bash で実行する方式にする。
+curl -fsSL https://rclone.org/install.sh -o /tmp/rclone-install.sh
+sudo bash /tmp/rclone-install.sh
 rclone version | head -n 1
 
-echo "[INFO] === Python 依存 (google-api-python-client, requests, chat-downloader) ==="
-# ジョブごとに作り直されるので venv は作らず、pip install --user で入れる。
-# （chat-downloader は Twitch 用）
-python3 -m pip install --user --upgrade \
-  google-api-python-client \
-  requests \
-  chat-downloader
-
-# PATH にユーザー/site-packages を通す（googleapiclient の import 用）
-RC_LINES='export PATH="$HOME/.local/bin:$PATH"'
-grep -q 'HOME/.local/bin' ~/.bashrc 2>/dev/null || echo "$RC_LINES" >> ~/.bashrc
-export PATH="$HOME/.local/bin:$PATH"
+echo "[INFO] === Python 依存 (venv に統一) ==="
+# ubuntu-24.04 (ubuntu-latest) のシステム Python は PEP 668
+# (externally-managed-environment) のため、`pip install --user` は失敗する。
+# そのためリポジトリ直下に .venv を作り、venv の pip で入れる。
+# requirements.txt が唯一の依存定義（YouTube 用 + Twitch 用 chat-downloader を含む）。
+python3 -m venv .venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install -r requirements.txt
+export PATH="$PWD/.venv/bin:$PATH"
 
 echo "[INFO] === バージョン確認 ==="
-python3 -c "import googleapiclient; print('googleapiclient OK')"
-command -v chat_downloader >/dev/null 2>&1 && echo "chat_downloader OK" || echo "chat_downloader: 未検出（動画のみ記録）"
-python3 -c "import requests; print('requests OK')"
+.venv/bin/python -c "import googleapiclient; print('googleapiclient OK')"
+.venv/bin/python -c "import requests; print('requests OK')"
+if [ -x .venv/bin/chat_downloader ]; then
+  echo "chat_downloader OK"
+else
+  echo "chat_downloader: 未検出（動画のみ記録）"
+fi
 
 echo "[INFO] === セットアップ完了 ==="

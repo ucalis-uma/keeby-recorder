@@ -17,8 +17,9 @@ CONFIG_PATH="${HOME}/.config/rclone/rclone.conf"
 mkdir -p "$(dirname "$CONFIG_PATH")"
 
 if [ -z "${RCLONE_CONFIG_B64:-}" ]; then
-  echo "[ERROR] RCLONE_CONFIG_B64 が設定されていません。"
-  exit 1
+  echo "[WARN] RCLONE_CONFIG_B64 未設定。アップロードなしで続行します。"
+  echo "[WARN] 録画自体は継続します（upload_with_rclone が失敗しても job は継続）。"
+  exit 0
 fi
 
 echo "$RCLONE_CONFIG_B64" | base64 -d > "$CONFIG_PATH"

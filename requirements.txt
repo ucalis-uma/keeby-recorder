@@ -1,8 +1,13 @@
 # GitHub Actions ランナーにインストールする Python 依存
-# （setup_dependencies.sh で pip install --user する想定。ローカル検証用にも使う）
+# （setup_dependencies.sh が .venv を作り `pip install -r requirements.txt` する。
+#  ローカル検証用に `pip install -r requirements.txt` してもよい）
 
 # YouTube Data API（ライブ検知用）
 google-api-python-client>=2.0.0
 
 # HTTP クライアント
 requests>=2.31.0
+
+# Twitch チャット保存用（twitch_recorder.py が使用。無くても動画のみ記録で動く）
+# バージョン固定なし（旧VPSも無印 chat-downloader を使用）
+chat-downloader

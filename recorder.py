@@ -25,6 +25,7 @@ import socket
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -116,6 +117,16 @@ def get_dir_size(path):
             except OSError:
                 pass
     return total
+
+
+def format_bytes(size):
+    """バイト数を人間が読みやすい表記に変換（旧VPS版と同一）"""
+    size = float(size)
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size < 1024:
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}TB"
 
 
 def rescue_part_files(download_dir):
@@ -395,9 +406,14 @@ def main():
     api_manager = YouTubeAPIManager(API_KEYS)
 
     cookies_file = os.environ.get("COOKIES_FILE")
-    if cookies_file and not os.path.exists(cookies_file):
-        logger.warning(f"COOKIES_FILE が存在しません: {cookies_file}（Cookieなしで続行）")
-        cookies_file = None
+    if cookies_file:
+        if os.path.exists(cookies_file):
+            logger.info(f"Cookie を使用します: {cookies_file}")
+        else:
+            logger.warning(f"COOKIES_FILE が存在しません: {cookies_file}（Cookieなしで続行）")
+            cookies_file = None
+    else:
+        logger.info("COOKIES_FILE 未設定（Cookieなしで続行）")
 
     # --- ライブチェック（各チャンネルを1回だけ。1つでも見つかれば録画） ---
     found_live = False
@@ -422,6 +438,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import datetime  # noqa: E402  (ログ出力で使うため遅延import)
-
     main()

@@ -19,7 +19,7 @@
 | 料金 | public リポジトリ + 標準ランナーは **free & unlimited**。支払い方法の登録も不要 |
 | ランナー性能（public） | Linux x64: **4 vCPU / 16GB RAM / 14GB SSD** |
 | ジョブ実行時間 | **最大6時間**（`timeout-minutes` で設定。350分=約5.8時間を設定） |
-| cron | 15分間隔（`5,20,35,50 * * *`）。**`:00` は実行集中で遅延・drop しやすいため意図的にずらす** |
+| cron | 15分間隔（`5,20,35,50 * * * *`）。**`:00` は実行集中で遅延・drop しやすいため意図的にずらす** |
 | 60日ルール | **public リポジトリは60日アクティビティが無ければ schedule が自動disable** → `keepalive.yml` で対策 |
 
 旧VPSは 2GB メモリ + 4GB スワップで稼働していた。YouTube Data API キーを複数登録し、キーごとにフェイルオーバーさせて運用していた。
@@ -125,9 +125,13 @@ github-actions/
 GitHub公式ドキュメントに「**毎時0分は実行が集中し、遅延およびdropが起きうる**」と明記されている。
 そのため本リポジトリでは：
 
-- YouTube: `5,20,35,50 * * *`（15分間隔、`:00` を回避）
-- Twitch: `12,27,42,57 * * *`（15分間隔、YouTube側と時刻をずらす）
+- YouTube: `5,20,35,50 * * * *`（15分間隔、`:00` を回避）
+- Twitch: `12,27,42,57 * * * *`（15分間隔、YouTube側と時刻をずらす）
 - keepalive: `12 3 * * *`（毎日3:12）
+
+> 注意: GitHub Actions の cron は5フィールド必須（分 時 日 月 曜日）。
+> 4フィールド（例 `5,20,35,50 * * *`）では
+> `invalid cron attribute` でワークフロー自体が起動不可になる。
 
 ---
 
@@ -153,10 +157,29 @@ GitHub公式ルール「**public リポジトリは60日アクティビティ無
 
 ## 8. 開発
 
-構文/YAML/文字化けのチェックは以下で一括実行できます（Windows ローカルでも）:
+構文/YAML/cron/実行時名前・文字化けのチェックは以下で一括実行できます（Windows ローカルでも）:
 
 ```powershell
 cd C:\Users\umaro\Videos\xserver\github-actions
 $env:PYTHONIOENCODING='utf-8'
 python check_all.py
 ```
+
+---
+
+## 9. 修正履歴（初回 Actions 失敗の調査結果）
+
+初回 push（`b75f28c`）直後の Actions 実行は、ワークフロー自体が起動不可だった。
+`actions/runs/37194592094` の注釈に `invalid cron attribute "5,20,35,50 * * *"` と出ていた。
+以下を修正済み：
+
+| # | 原因 | 修正 |
+|---|---|---|
+| 1 | cron が4フィールド（`5,20,35,50 * * *`）で `invalid cron attribute` になり起動不可 | 5フィールド化（`5,20,35,50 * * * *` / Twitch 側も同様）。`check_all.py` に5フィールド検査を追加 |
+| 2 | `setup_dependencies.sh` の `pip install --user` が ubuntu-24.04（PEP 668）で `externally-managed-environment` エラー | リポジトリ直下に `.venv` を作り `pip install -r requirements.txt` に統一。workflow 側は `.venv/bin/python` で実行 |
+| 3 | `setup_rclone.sh` が `RCLONE_CONFIG_B64` 未設定で `exit 1`（Secret 未登録だと録画前に即死） | 未設定時は警告のみで `exit 0`（アップロードなしで録画継続）。`recorder.py` の `upload_with_rclone()` は元から失敗時も例外を投げない設計 |
+| 4 | `recorder.py` の `format_bytes` 未定義・`datetime` が `if __name__` 内遅延 import のみ | `format_bytes` を追加（旧VPS版と同一ロジック）、`from datetime import datetime` を冒頭に移動。`check_all.py` に必須名検査を追加 |
+| 5 | Twitch 側が `setup_dependencies.sh` と workflow 内で二重に venv/`chat-downloader` を導入 | `requirements.txt` に `chat-downloader` を集約し `.venv` 一本化。workflow 側の `.venv-twitch` 作成手順を削除 |
+| 6 | workflow が `cookies.txt` を `$HOME` に書くのに `recorder.py` へパスを渡していない（`COOKIES_FILE` 未配線） | workspace 直下に書き出し、`COOKIES_FILE` 環境変数で明示的に渡す。存在しない場合は警告して Cookie なしで継続 |
+
+その他：yt-dlp の安定版→nightly 二重取得を nightly 1回に整理、Deno 導入は `sudo env DENO_INSTALL=...` 方式に変更（`sudo` の `env_reset` 対策）、rclone 導入は先にダウンロードしてから `sudo bash` する方式に変更。
