@@ -182,5 +182,38 @@ python check_all.py
 | 5 | Twitch 側が `setup_dependencies.sh` と workflow 内で二重に venv/`chat-downloader` を導入 | `requirements.txt` に `chat-downloader` を集約し `.venv` 一本化。workflow 側の `.venv-twitch` 作成手順を削除 |
 | 6 | workflow が `cookies.txt` を `$HOME` に書くのに `recorder.py` へパスを渡していない（`COOKIES_FILE` 未配線） | workspace 直下に書き出し、`COOKIES_FILE` 環境変数で明示的に渡す。存在しない場合は警告して Cookie なしで継続 |
 | 7 | `RCLONE_BIN` を `/usr/local/bin/rclone` に固定していたが rclone installer は `/usr/bin` に置く場合があり `FileNotFoundError` の恐れ | `RCLONE_BIN: rclone` にして PATH 解決に任せる（`setup_rclone.sh` の `rclone listremotes` と同じ解決）。Python 側も `FileNotFoundError` を捕捉して警告のみで継続 |
+| 8 | Drive 満杯時にテスト録画ができず、かつ YouTube 側が rclone 失敗でもローカル削除していた（録画消失の恐れ） | `TEST_LIVE_URL` / `TEST_TARGET_URL` / `TEST_MAX_SECONDS` / `SKIP_UPLOAD` を追加。`workflow_dispatch` の inputs から指定し、Drive に触らず artifact で回収するドライラン方式に。YouTube 側もアップロード成功時のみ削除に変更 |
 
 その他：yt-dlp の安定版→nightly 二重取得を nightly 1回に整理、Deno 導入は `sudo env DENO_INSTALL=...` 方式に変更（`sudo` の `env_reset` 対策）、rclone 導入は先にダウンロードしてから `sudo bash` する方式に変更。
+
+---
+
+## 10. ドライラン手順（Drive が満杯でもテスト可）
+
+Drive に一切書き込まず、録画パイプライン（yt-dlp + deno + ffmpeg 結合）を通す手順。
+本番の cron には影響しない（inputs 未指定時＝空文字・`0`・false は従来の本番動作）。
+
+YouTube 側：`Actions → YouTube Live Recorder → Run workflow` で以下を指定
+
+| input | 例 | 意味 |
+|---|---|---|
+| `test_live_url` | `https://www.youtube.com/watch?v=...`（適当なライブ/動画URL） | API 検知をスキップし直接録画 |
+| `test_max_seconds` | `90` | 90秒で打ち切り終了 |
+| `skip_upload` | `true` | Drive へ上げずローカル保持→artifact 保存 |
+
+Twitch 側：`Actions → Twitch Live Recorder → Run workflow` で以下を指定
+
+| input | 例 | 意味 |
+|---|---|---|
+| `test_target_url` | `https://www.twitch.tv/...`（適当な配信/アーカイブURL） | 配信検知をスキップし直接録画 |
+| `test_max_seconds` | `90` | 90秒で打ち切り終了 |
+| `skip_upload` | `true` | Drive へ上げずローカル保持→artifact 保存 |
+
+確認：run 終了後に `Artifacts` の `youtube-test-recording` / `twitch-test-recording`
+（3日保持）をダウンロードし、mp4 が再生できれば成功。Drive 容量は消費しない。
+SMALL（短い動画・テスト用URL）を選ぶと artifact も小さく済む。
+
+> テスト時は通常の動画URLでも落とせるよう `--live-from-start` を外す（本番は付与）。
+> そのため短い通常動画をテストURLに使える。なお YouTube 側のコメント取得
+> （`--write-comments`）はライブ以外では空になる場合があるが、
+> 動画DLの成否確認には影響しない。

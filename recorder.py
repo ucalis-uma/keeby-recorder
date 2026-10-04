@@ -62,6 +62,17 @@ CHANNEL_IDS = [
 STALL_TIMEOUT = 1800          # 30分間サイズ変化なしなら停滞(=配信終了)とみなす
 WATCHDOG_CHECK_INTERVAL = 60   # 1分ごとにサイズチェック
 
+# --- テスト用（workflow_dispatch の inputs から注入。既定は本番動作） ---
+# TEST_LIVE_URL : 指定時は API 検知をスキップし、その URL を直接録画する
+# TEST_MAX_SECONDS : 指定時はその秒数で動画DLを打ち切りドライラン終了する
+# SKIP_UPLOAD : "1" のとき rclone 実行とローカル削除を両方スキップする
+TEST_LIVE_URL = os.environ.get("TEST_LIVE_URL", "").strip()
+try:
+    TEST_MAX_SECONDS = int(os.environ.get("TEST_MAX_SECONDS", "0") or "0")
+except ValueError:
+    TEST_MAX_SECONDS = 0
+SKIP_UPLOAD = os.environ.get("SKIP_UPLOAD", "") == "1"
+
 BASE_DIR = os.environ.get("KEEBY_BASE_DIR", os.getcwd())
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 COMMENTS_DIR = os.path.join(BASE_DIR, "comments")
@@ -213,20 +224,42 @@ def check_live_status(api_manager, target_channel_id):
 # ============================================================
 # ウォッチドッグ付きダウンロード実行
 # ============================================================
-def run_with_watchdog(command, watch_dir, label="process"):
+def run_with_watchdog(command, watch_dir, label="process", max_seconds=0):
     """
     子プロセスを起動し、watch_dir のサイズを定期監視。
     STALL_TIMEOUT 秒間サイズが変化しなければプロセスを強制終了（配信終了とみなす）。
-    旧VPS版と同一ロジック。
+    旧VPS版と同一ロジック。max_seconds > 0 のときはテスト用にその秒数で打ち切る。
+    戻り値: プロセス終了コード（停滞打ち切り時は -1、時間打ち切り時は -2）。
     """
     proc = subprocess.Popen(command, start_new_session=True)
     logger.info(f"[{label}] PID {proc.pid} (PGID {os.getpgid(proc.pid)}) で開始")
+    if max_seconds > 0:
+        logger.info(f"[{label}] テストモード: {max_seconds}秒で打ち切ります。")
 
     last_size = get_dir_size(watch_dir)
     last_change_time = time.time()
+    start_time = time.time()
+    # テスト時は短時間打ち切りのため監視間隔を短くする（本番は60秒のまま）
+    interval = min(10, WATCHDOG_CHECK_INTERVAL) if max_seconds > 0 else WATCHDOG_CHECK_INTERVAL
 
     while proc.poll() is None:
-        time.sleep(WATCHDOG_CHECK_INTERVAL)
+        time.sleep(interval)
+        if max_seconds > 0 and (time.time() - start_time) >= max_seconds:
+            logger.info(f"[{label}] テスト時間に到達。SIGINTで停止します。")
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                logger.warning(f"[{label}] 停止待ちタイムアウト。SIGKILLします。")
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    proc.wait()
+                except ProcessLookupError:
+                    pass
+            return -2
         current_size = get_dir_size(watch_dir)
 
         if current_size != last_size:
@@ -281,18 +314,19 @@ def run_with_watchdog(command, watch_dir, label="process"):
 # アップロード・後始末
 # ============================================================
 def upload_with_rclone(cmd):
-    """rclone アップロード。失敗しても例外を投げずログのみ（jobは失敗させない）。"""
+    """rclone アップロード。成功時 True。失敗・未検出時は例外を投げず False（jobは失敗させない）。"""
     logger.info(f"rclone: {' '.join(cmd)}")
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     except FileNotFoundError:
         logger.warning(f"rclone が見つかりません（{cmd[0]}）。アップロードをスキップします。")
-        return
+        return False
     if res.returncode != 0:
         out = res.stdout.decode("utf-8", errors="replace")[-2000:] if res.stdout else "(none)"
         logger.warning(f"rclone が失敗 (コード: {res.returncode})。出力: {out}")
-    else:
-        logger.info("rclone 完了。")
+        return False
+    logger.info("rclone 完了。")
+    return True
 
 
 def cleanup_dir(path):
@@ -327,9 +361,12 @@ def execute_scripts(live_url, cookies_file=None):
     comment_proc = subprocess.Popen(comment_cmd, start_new_session=True)
 
     # --- 動画ダウンロード（ウォッチドッグ付き） ---
-    video_cmd = [
-        YT_DLP_BIN,
-        "--live-from-start",
+    # テスト時は通常の動画URLでも落とせるよう --live-from-start を外す（本番は付与）。
+    is_test = bool(TEST_LIVE_URL)
+    video_cmd = [YT_DLP_BIN]
+    if not is_test:
+        video_cmd.append("--live-from-start")
+    video_cmd += [
         "--retries", "infinite",
         "--fragment-retries", "infinite",
         "--socket-timeout", "30",
@@ -340,7 +377,9 @@ def execute_scripts(live_url, cookies_file=None):
         video_cmd += ["--cookies", cookies_file]
     video_cmd.append(live_url)
 
-    video_exit = run_with_watchdog(video_cmd, DOWNLOAD_DIR, label="動画DL")
+    video_exit = run_with_watchdog(
+        video_cmd, DOWNLOAD_DIR, label="動画DL", max_seconds=TEST_MAX_SECONDS
+    )
 
     # --- 動画DL終了後にコメントDLも終了させる ---
     logger.info("動画DLが終了。コメント取得プロセスを終了...")
@@ -372,21 +411,34 @@ def execute_scripts(live_url, cookies_file=None):
             logger.warning("未結合の .part/.ytdl が残っています。手動再結合を試みます。")
             rescue_part_files(DOWNLOAD_DIR)
 
-        logger.info(f"Google Driveへアップロード中... (動画: {format_bytes(dl_size)})")
-        upload_with_rclone(
-            [RCLONE_BIN, "copy", DOWNLOAD_DIR, GDRIVE_VIDEO_DEST, "--drive-chunk-size=64M"]
-        )
-        upload_with_rclone(
-            [RCLONE_BIN, "copy", COMMENTS_DIR, GDRIVE_COMMENT_DEST, "--drive-chunk-size=64M"]
-        )
-        cleanup_dir(DOWNLOAD_DIR)
-        cleanup_dir(COMMENTS_DIR)
-        logger.info("アップロード完了 & ローカル削除済み。")
+        if SKIP_UPLOAD:
+            logger.info(
+                f"SKIP_UPLOAD=1 のため Drive へ上げずローカル保持します "
+                f"(動画: {format_bytes(dl_size)}。artifact で回収できます)。"
+            )
+        else:
+            logger.info(f"Google Driveへアップロード中... (動画: {format_bytes(dl_size)})")
+            ok_video = upload_with_rclone(
+                [RCLONE_BIN, "copy", DOWNLOAD_DIR, GDRIVE_VIDEO_DEST, "--drive-chunk-size=64M"]
+            )
+            ok_comment = upload_with_rclone(
+                [RCLONE_BIN, "copy", COMMENTS_DIR, GDRIVE_COMMENT_DEST, "--drive-chunk-size=64M"]
+            )
+            if ok_video and ok_comment:
+                cleanup_dir(DOWNLOAD_DIR)
+                cleanup_dir(COMMENTS_DIR)
+                logger.info("アップロード完了 & ローカル削除済み。")
+            else:
+                logger.warning(
+                    "アップロード不完全のためローカルは保持します（Drive 満杯時はここで止まります）。"
+                )
     else:
         logger.warning("ダウンロードファイルが0バイトです。アップロードをスキップします。")
 
     if video_exit == -1:
         logger.info("(ウォッチドッグにより停止 — 配信は正常に終了した可能性が高い)")
+    elif video_exit == -2:
+        logger.info("(テスト時間打ち切り — ドライラン正常終了)")
 
     logger.info("========== 録画サイクル完了 ==========")
 
@@ -399,6 +451,24 @@ def main():
     logger.info(f"監視チャンネル数: {len(CHANNEL_IDS)}")
     logger.info(f"ウォッチドッグタイムアウト: {STALL_TIMEOUT // 60}分")
     logger.info(f"開始時刻: {datetime.now().isoformat(timespec='seconds')}")
+    if TEST_LIVE_URL:
+        logger.info(f"テストモード: TEST_LIVE_URL={TEST_LIVE_URL}")
+    if TEST_MAX_SECONDS > 0:
+        logger.info(f"テストモード: TEST_MAX_SECONDS={TEST_MAX_SECONDS}秒")
+    if SKIP_UPLOAD:
+        logger.info("テストモード: SKIP_UPLOAD=1（Drive へ上げずローカル保持）")
+
+    if TEST_LIVE_URL:
+        # テスト時は API 検知をスキップし、指定 URL を直接録画する。
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        os.makedirs(COMMENTS_DIR, exist_ok=True)
+        cookies_file = os.environ.get("COOKIES_FILE")
+        if cookies_file and not os.path.exists(cookies_file):
+            logger.warning(f"COOKIES_FILE が存在しません: {cookies_file}（Cookieなしで続行）")
+            cookies_file = None
+        execute_scripts(TEST_LIVE_URL, cookies_file=cookies_file)
+        logger.info("テスト録画が完了しました。")
+        return
 
     if not API_KEYS:
         logger.error("YOUTUBE_API_KEYS が未設定です。")

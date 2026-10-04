@@ -20,8 +20,26 @@ on:
     # 15分間隔（毎時0分は避ける: 分5,20,35,50）
     # GitHub Actionsのcronは5フィールド必須（分 時 日 月 曜日）
     - cron: '5,20,35,50 * * * *'
-  # 手動実行（初回テスト用）
+  # 手動実行（初回テスト用・ドライラン用）
+  # ドライラン例: test_live_url に適当なライブ/動画URL、test_max_seconds に 90、
+  # skip_upload に true を指定すると、Drive に触らず artifact で回収できる。
   workflow_dispatch:
+    inputs:
+      test_live_url:
+        description: 'テスト用URL（空なら通常のAPI検知。例: https://www.youtube.com/watch?v=...）'
+        required: false
+        default: ''
+        type: string
+      test_max_seconds:
+        description: 'テスト録画秒数（0=打ち切りなし本番動作。例: 90）'
+        required: false
+        default: '0'
+        type: string
+      skip_upload:
+        description: 'Driveへ上げずローカル保持（テスト用）'
+        required: false
+        default: false
+        type: boolean
 
 # 同時実行させない（前の録画中に次のcronが走って二重録画＆runner枠の消費を防ぐ）
 concurrency:
@@ -74,6 +92,9 @@ jobs:
           KEEBY_BASE_DIR: ${{ github.workspace }}
           LOG_DIR: ${{ github.workspace }}/logs
           COOKIES_FILE: ${{ github.workspace }}/cookies.txt
+          TEST_LIVE_URL: ${{ inputs.test_live_url }}
+          TEST_MAX_SECONDS: ${{ inputs.test_max_seconds }}
+          SKIP_UPLOAD: ${{ inputs.skip_upload && '1' || '' }}
         # setup_dependencies.sh が作った .venv の Python を使う
         # （PEP 668 のためシステム pip は使わない）。
         # COOKIES_FILE が存在しない場合 recorder.py 側で警告して継続する。
@@ -86,3 +107,14 @@ jobs:
           name: recorder-logs
           path: ${{ github.workspace }}/logs
           retention-days: 7
+      - name: Upload test recording (dry-run only)
+        # SKIP_UPLOAD=1 のドライラン時のみ。Drive に上げず artifact で回収する。
+        if: ${{ inputs.skip_upload }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-test-recording
+          path: |
+            ${{ github.workspace }}/downloads
+            ${{ github.workspace }}/comments
+          retention-days: 3
+          if-no-files-found: warn

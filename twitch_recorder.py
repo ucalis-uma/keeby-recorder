@@ -52,6 +52,17 @@ GDRIVE_TWITCH_DEST = os.environ.get("GDRIVE_TWITCH_DEST", f"{RCLONE_REMOTE}:/kee
 STALL_TIMEOUT = int(os.environ.get("TWITCH_STALL_TIMEOUT", "1800"))  # 30分
 CHECK_INTERVAL = int(os.environ.get("TWITCH_CHECK_INTERVAL", "60"))    # 1分
 
+# --- テスト用（workflow_dispatch の inputs から注入。既定は本番動作） ---
+# TEST_TARGET_URL : 指定時は配信検知をスキップし、その URL を直接録画する
+# TEST_MAX_SECONDS : 指定時はその秒数で打ち切りドライラン終了する
+# SKIP_UPLOAD : "1" のとき rclone 実行せずローカル保持する（Drive 不使用）
+TEST_TARGET_URL = os.environ.get("TEST_TARGET_URL", "").strip()
+try:
+    TEST_MAX_SECONDS = int(os.environ.get("TEST_MAX_SECONDS", "0") or "0")
+except ValueError:
+    TEST_MAX_SECONDS = 0
+SKIP_UPLOAD = os.environ.get("SKIP_UPLOAD", "") == "1"
+
 
 # ============================================================
 # ユーティリティ
@@ -126,25 +137,31 @@ def upload_to_drive():
 # ============================================================
 # 録画本体
 # ============================================================
-def record_and_upload(with_chat=True):
+def record_and_upload(with_chat=True, target_url=None, max_seconds=0):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    target_url = target_url or TARGET_URL
 
     base_name = f"{OUTPUT_DIR}/{STREAMER_ID}_live"
     video_pattern = f"{base_name}.%(ext)s"
     chat_file = f"{base_name}_chat.json"
 
-    logger.info(f"配信検知！録画開始... target={TARGET_URL}")
+    logger.info(f"配信検知！録画開始... target={target_url}")
+    if max_seconds > 0:
+        logger.info(f"テストモード: {max_seconds}秒で打ち切ります。")
 
     # --- A. 動画DL ---
-    p_video = subprocess.Popen(
-        [YT_DLP_BIN, "--live-from-start", "-o", video_pattern, TARGET_URL]
-    )
+    # テスト時は通常の動画URLでも落とせるよう --live-from-start を外す（本番は付与）。
+    video_cmd = [YT_DLP_BIN]
+    if not TEST_TARGET_URL:
+        video_cmd.append("--live-from-start")
+    video_cmd += ["-o", video_pattern, target_url]
+    p_video = subprocess.Popen(video_cmd)
 
     # --- B. チャットDL（chat_downloader があれば） ---
     p_chat = None
     if with_chat:
         p_chat = subprocess.Popen(
-            [CHAT_DOWNLOADER_BIN, TARGET_URL, "--output", chat_file],
+            [CHAT_DOWNLOADER_BIN, target_url, "--output", chat_file],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -152,9 +169,22 @@ def record_and_upload(with_chat=True):
     # --- 停滞監視しながら p_video の終了を待つ ---
     last_size = get_dir_size(OUTPUT_DIR)
     last_change = time.time()
+    start_time = time.time()
+    test_cutoff = False
+    # テスト時は短時間打ち切りのため監視間隔を短くする（本番は既定60秒のまま）
+    interval = min(10, CHECK_INTERVAL) if max_seconds > 0 else CHECK_INTERVAL
 
     while p_video.poll() is None:
-        time.sleep(CHECK_INTERVAL)
+        time.sleep(interval)
+        if max_seconds > 0 and (time.time() - start_time) >= max_seconds:
+            logger.info("テスト時間に到達。動画DLを停止します。")
+            p_video.terminate()
+            try:
+                p_video.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                p_video.kill()
+            test_cutoff = True
+            break
         cur = get_dir_size(OUTPUT_DIR)
         if cur != last_size:
             logger.info(f"DL中... size={cur / (1024 ** 2):.1f}MB")
@@ -179,7 +209,13 @@ def record_and_upload(with_chat=True):
         except subprocess.TimeoutExpired:
             p_chat.kill()
 
-    upload_to_drive()
+    if SKIP_UPLOAD:
+        logger.info("SKIP_UPLOAD=1 のため Drive へ上げずローカル保持します（artifact で回収できます）。")
+    else:
+        upload_to_drive()
+
+    if test_cutoff:
+        logger.info("(テスト時間打ち切り — ドライラン正常終了)")
 
 
 # ============================================================
@@ -188,6 +224,26 @@ def record_and_upload(with_chat=True):
 def main():
     logger.info("===== Keeby Twitch Recorder (Actions版) 起動 =====")
     logger.info(f"対象: {TARGET_URL}")
+    if TEST_TARGET_URL:
+        logger.info(f"テストモード: TEST_TARGET_URL={TEST_TARGET_URL}")
+    if TEST_MAX_SECONDS > 0:
+        logger.info(f"テストモード: TEST_MAX_SECONDS={TEST_MAX_SECONDS}秒")
+    if SKIP_UPLOAD:
+        logger.info("テストモード: SKIP_UPLOAD=1（Drive へ上げずローカル保持）")
+
+    target_url = TEST_TARGET_URL or TARGET_URL
+
+    if TEST_TARGET_URL:
+        # テスト時は配信検知をスキップし、指定 URL を直接録画する。
+        have_chat = (
+            os.path.isfile(CHAT_DOWNLOADER_BIN)
+            and os.access(CHAT_DOWNLOADER_BIN, os.X_OK)
+        )
+        if not have_chat:
+            logger.warning(f"{CHAT_DOWNLOADER_BIN} が見つかりません。チャット保存なしで続行。")
+        record_and_upload(with_chat=have_chat, target_url=target_url, max_seconds=TEST_MAX_SECONDS)
+        logger.info("テスト録画が完了しました。")
+        return
 
     if not is_streaming():
         logger.info("配信していません。何もしないで終了します。")

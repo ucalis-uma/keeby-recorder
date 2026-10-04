@@ -18,7 +18,26 @@ on:
     # 15分間隔（毎時0分は避ける / YouTube側とずらす: 分 12,27,42,57）
     # GitHub Actionsのcronは5フィールド必須（分 時 日 月 曜日）
     - cron: '12,27,42,57 * * * *'
+  # 手動実行（初回テスト用・ドライラン用）
+  # ドライラン例: test_target_url に適当な配信/動画URL、test_max_seconds に 90、
+  # skip_upload に true を指定すると、Drive に触らず artifact で回収できる。
   workflow_dispatch:
+    inputs:
+      test_target_url:
+        description: 'テスト用URL（空なら通常の配信検知。例: https://www.twitch.tv/...）'
+        required: false
+        default: ''
+        type: string
+      test_max_seconds:
+        description: 'テスト録画秒数（0=打ち切りなし本番動作。例: 90）'
+        required: false
+        default: '0'
+        type: string
+      skip_upload:
+        description: 'Driveへ上げずローカル保持（テスト用）'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: twitch-recorder
@@ -55,6 +74,9 @@ jobs:
           CHAT_DOWNLOADER_BIN: ${{ github.workspace }}/.venv/bin/chat_downloader
           KEEBY_BASE_DIR: ${{ github.workspace }}
           LOG_DIR: ${{ github.workspace }}/logs
+          TEST_TARGET_URL: ${{ inputs.test_target_url }}
+          TEST_MAX_SECONDS: ${{ inputs.test_max_seconds }}
+          SKIP_UPLOAD: ${{ inputs.skip_upload && '1' || '' }}
         run: .venv/bin/python twitch_recorder.py
 
       - name: Upload logs (for debugging)
@@ -64,3 +86,13 @@ jobs:
           name: twitch-recorder-logs
           path: ${{ github.workspace }}/logs
           retention-days: 7
+
+      - name: Upload test recording (dry-run only)
+        # SKIP_UPLOAD=1 のドライラン時のみ。Drive に上げず artifact で回収する。
+        if: ${{ inputs.skip_upload }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: twitch-test-recording
+          path: ${{ github.workspace }}/twitch_temp
+          retention-days: 3
+          if-no-files-found: warn

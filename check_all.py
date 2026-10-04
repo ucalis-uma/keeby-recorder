@@ -54,8 +54,13 @@ def check_runtime_imports():
     ok = True
     # ファイルごとに「トップレベルで定義必須」の名前
     required = {
-        "recorder.py": {"format_bytes", "datetime"},
-        "twitch_recorder.py": set(),
+        "recorder.py": {
+            "format_bytes", "datetime",
+            "TEST_LIVE_URL", "TEST_MAX_SECONDS", "SKIP_UPLOAD",
+        },
+        "twitch_recorder.py": {
+            "TEST_TARGET_URL", "TEST_MAX_SECONDS", "SKIP_UPLOAD",
+        },
     }
     for f in sorted(ROOT.glob("*.py")):
         if f.name == "check_all.py" or f.name not in required:
@@ -66,16 +71,43 @@ def check_runtime_imports():
             print(f"  [FAIL] {f.name}: {e}")
             ok = False
             continue
+        # モジュールスコープの定義を収集する。
+        # try/except 内の代入（TEST_MAX_SECONDS 等）も対象にするため、
+        # 関数・クラス内部を除いたすべての Assign/Import/def を集める。
         top_defined = set()
-        for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                top_defined.add(node.name)
-            elif isinstance(node, ast.Import):
-                for a in node.names:
-                    top_defined.add((a.asname or a.name).split(".")[0])
-            elif isinstance(node, ast.ImportFrom):
-                for a in node.names:
-                    top_defined.add(a.asname or a.name)
+
+        def visit(node, in_func=False):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                if not in_func:
+                    top_defined.add(getattr(node, "name", "<lambda>"))
+                for child in ast.iter_child_nodes(node):
+                    visit(child, in_func=True)
+                return
+            if not in_func:
+                if isinstance(node, ast.Import):
+                    for a in node.names:
+                        top_defined.add((a.asname or a.name).split(".")[0])
+                elif isinstance(node, ast.ImportFrom):
+                    for a in node.names:
+                        top_defined.add(a.asname or a.name)
+                elif isinstance(node, ast.Assign):
+                    for t in node.targets:
+                        if isinstance(t, ast.Name):
+                            top_defined.add(t.id)
+                        elif isinstance(t, (ast.Tuple, ast.List)):
+                            for e in t.elts:
+                                if isinstance(e, ast.Name):
+                                    top_defined.add(e.id)
+                elif isinstance(node, ast.AnnAssign):
+                    if isinstance(node.target, ast.Name):
+                        top_defined.add(node.target.id)
+                elif isinstance(node, ast.NamedExpr):
+                    if isinstance(node.target, ast.Name):
+                        top_defined.add(node.target.id)
+            for child in ast.iter_child_nodes(node):
+                visit(child, in_func)
+
+        visit(tree)
         want = required[f.name]
         missing = sorted(n for n in want if n not in top_defined)
         if missing:
