@@ -99,6 +99,13 @@ jobs:
         # （PEP 668 のためシステム pip は使わない）。
         # COOKIES_FILE が存在しない場合 recorder.py 側で警告して継続する。
         run: .venv/bin/python recorder.py
+      - name: Fail on YouTube cookie errors
+        if: always()
+        run: |
+          if [ -f logs/recorder.log ] && grep -qE "cookies are no longer valid|Sign in to confirm you" logs/recorder.log; then
+            echo "::error::YouTube cookies expired or invalid. Update COOKIES_TXT."
+            exit 1
+          fi
       - name: Upload logs (for debugging)
         # 録画自体には不要だが、失敗時の調査用。artifact は小さいので問題なし。
         if: always()

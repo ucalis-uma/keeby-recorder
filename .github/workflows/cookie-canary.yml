@@ -1,0 +1,71 @@
+name: YouTube Cookie Canary
+
+on:
+  schedule:
+    - cron: '43 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: youtube-cookie-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install yt-dlp and deno
+        run: |
+          sudo curl -fL https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+          curl -fsSL https://deno.land/install.sh | sudo env DENO_INSTALL=/usr/local sh -s -- -y
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+          yt-dlp --version
+          deno --version
+
+      - name: Random delay
+        run: sleep $((RANDOM % 600))
+
+      - name: Check cookie canary
+        id: check
+        env:
+          COOKIES_TXT: ${{ secrets.COOKIES_TXT }}
+        run: |
+          printf '%s' "$COOKIES_TXT" > cookies.txt
+          python cookie_check.py canary --cookies cookies.txt --attempts 5
+
+      - name: Open issue on failure
+        if: failure() && steps.check.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="YouTube cookie canary failed"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -z "$existing" ]; then
+            body=$(printf 'The daily YouTube cookie canary failed.\n\nThis can mean expired cookies, bot verification, or a yt-dlp/JS runtime problem. Check the run log first, then update the `COOKIES_TXT` secret if needed:\nhttps://github.com/%s/settings/secrets/actions\n\nRun: %s/%s/actions/runs/%s' "$GITHUB_REPOSITORY" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+
+      - name: Close issue on recovery
+        if: success() && steps.check.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="YouTube cookie canary failed"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$GITHUB_REPOSITORY" --comment "Cookie canary recovered."
+          fi

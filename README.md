@@ -36,11 +36,14 @@ github-actions/
 ├── setup_rclone.sh                    # Secrets から rclone.conf を生成
 ├── requirements.txt                   # Python 依存
 ├── check_all.py                       # 開発用チェック（YAML/構文/文字化け）
+├── cookie_check.py                    # Cookie検査（ログイン確認 / canary）
 ├── .gitattributes                     # LF・UTF-8 固定
 ├── .gitignore                         # 録画データ・認証情報・venv を除外
 └── .github/workflows/
     ├── youtube-recorder.yml           # YouTube用 cron ジョブ
     ├── twitch-recorder.yml            # Twitch用 cron ジョブ
+    ├── cookie-check.yml               # 毎時のcookieログイン確認
+    ├── cookie-canary.yml              # 日次のcookie canary
     └── keepalive.yml                  # 60日ルール対策（毎日 空コミット push）
 ```
 
@@ -51,7 +54,7 @@ github-actions/
 ### 3-1. リポジトリ作成（public・無料）
 
 1. GitHub（**`ucalis-uma` アカウント**）で新規リポジトリ `keeby-recorder` を作成し、**Public** にする。
-   - private でも動作するが、Actions の分数上限（月2,000分）が適用され、超過時は課金はblocked（カード未登録でも課金は発生しないが制限される）。**public の方が制約无表情**。
+   - private でも動作するが、Actions の分数上限（月2,000分）が適用され、超過時は課金はblocked（カード未登録でも課金は発生しないが制限される）。**public の方が制約なし**。
 2. この `github-actions/` ディレクトリをリポジトリのルートへ push。
 
 ### 3-2. YouTube Data API キー
@@ -101,7 +104,7 @@ github-actions/
 |---|---|
 | `YOUTUBE_API_KEYS` | カンマ区切りのYouTube Data APIキー（例: `KEY1,KEY2,KEY3`） |
 | `RCLONE_CONFIG_B64` | 手順3-3で base64 化した `rclone.conf` |
-| `COOKIES_TXT` | `cookies.txt` の全文（任意。YouTubeの403対策。空でも動く） |
+| `COOKIES_TXT` | `cookies.txt` の全文（YouTubeの403対策・cookie監視用。空だとcookie監視は失敗する） |
 
 > `COOKIES_TXT` はログイン情報を含むため **必ず Secret** にして、リポジトリには置かないこと。
 
@@ -114,6 +117,7 @@ github-actions/
 3. ログに以下が出ればOK：
    - ライブ中なら `ライブ配信を検知: https://...` → 録画 → `Google Driveへアップロード中` → `アップロード完了`
    - ライブ無しなら `どのチャンネルもライブ配信なし。何もしないで終了します。`
+4. cookieを更新したら、`YouTube Cookie Check` と `YouTube Cookie Canary` も手動実行し、両方successになることを確認する。
 
 > **注意**: 実チャンネルがライブ中じゃないと「動画DL」には入らない。手動テスト時は一時的に `CHANNEL_IDS` を
 > ライブ中のチャンネルIDに変更するか、`workflow_dispatch` でそのまま実行してログの挙動を確かめること。
@@ -127,6 +131,8 @@ GitHub公式ドキュメントに「**毎時0分は実行が集中し、遅延�
 
 - YouTube: `5,20,35,50 * * * *`（15分間隔、`:00` を回避）
 - Twitch: `12,27,42,57 * * * *`（15分間隔、YouTube側と時刻をずらす）
+- cookie-check: `17 * * * *`（毎時17分。実行後に0〜5分のランダム待機）
+- cookie-canary: `43 4 * * *`（毎日4:43 UTC＝13:43 JST。実行後に0〜10分のランダム待機）
 - keepalive: `12 3 * * *`（毎日3:12）
 
 > 注意: GitHub Actions の cron は5フィールド必須（分 時 日 月 曜日）。
@@ -143,7 +149,7 @@ GitHub公式ルール「**public リポジトリは60日アクティビティ無
 
 ---
 
-## 7. 移行前の注意（VPS时代的差异）
+## 7. 移行前の注意（VPS時代との差異）
 
 | 項目 | 旧VPS | 現在のActions |
 |---|---|---|
@@ -238,3 +244,42 @@ SMALL（短い動画・テスト用URL）を選ぶと artifact も小さく済�
 | `Sign in to confirm you're not a bot` / `403` | YouTube の bot 検出 | `COOKIES_TXT` Secret を登録して再実行 |
 | `Private video` / `Video unavailable` | 非公開・削除済み・地域制限 | 別の公開動画URLで再テスト |
 | `Age-restricted` | 年齢制限（ログイン必須） | `COOKIES_TXT` 登録が必要。それでも不可なら別URLで再テスト |
+
+---
+
+## 12. Cookie監視（cookie-check / cookie-canary）
+
+YouTubeのcookieは数週間〜数か月で失効する。失効中は録画が `Sign in to confirm you're not a bot` などで失敗するが、従来は録画開始時まで気づけず、Jobもsuccess扱いになることがあった。現在は次の3段階で検知する。
+
+### 12-1. 毎時のログイン確認（cookie-check.yml）
+
+- 毎時17分に起動し、0〜5分のランダム待機後に1回だけ実行する。
+- `cookie_check.py login` が12個のURL（登録チャンネル、履歴、ライブラリ、後で見る、高評価、ホーム、急上昇、アカウント、コース、m.youtube版）から最大2個をランダムに選ぶ。
+- cookie付きHTTP GETのHTMLに `"LOGGED_IN":true` があるかだけを見る。動画のplayer APIは叩かない。
+- 失敗時はIssue `YouTube cookie session check failed` を作成し、Jobを失敗させる。次回成功時に自動クローズする。
+- Issue通知はリポジトリのIssues機能を使う。無効だとIssue作成ステップで失敗する（Job自体も失敗する）。
+- URL・User-Agent・待機時間を毎回変え、固定パターンのアクセスを避ける。
+
+### 12-2. 日次canary（cookie-canary.yml）
+
+- 毎日4:43 UTC（13:43 JST）に起動し、0〜10分のランダム待機後に実行する。
+- nightly yt-dlpとdenoを導入し、`cookie_check.py canary` が31本の公開動画リストから最大5本をランダムに選ぶ。
+- 各動画に `yt-dlp --simulate --cookies cookies.txt` を実行し、cookieで実際にメタデータ・フォーマットを取得できるか確認する。非公開・地域制限などで失敗した動画は読み飛ばす。
+- cookie失効・bot判定を検知したらIssue `YouTube cookie canary failed` を作成する。
+- 軽量チェックが通っても、player API側でだけ失敗する場合をここで拾う。
+
+### 12-3. 録画時の失敗検知（youtube-recorder.yml）
+
+- 録画後に `logs/recorder.log` を検査し、`cookies are no longer valid` または `Sign in to confirm you're not a bot` があればJobを失敗させる。
+- これにより「録画に失敗したのにJobはsuccess」という状態をなくす。ログは従来どおりartifact `recorder-logs` に残る。
+
+### 12-4. cookieを更新するとき
+
+1. ブラウザでYouTubeにログインし、Netscape形式のcookieを再取得する。
+2. GitHubの `Settings → Secrets and variables → Actions` で `COOKIES_TXT` を更新する。
+3. `Actions → YouTube Cookie Check → Run workflow` と `Actions → YouTube Cookie Canary → Run workflow` を手動実行する。
+4. 両方successになり、open中のcookie Issueが自動クローズされれば完了。
+
+> cookieの失効日時を事前に予測するものではない。失効後、最大約1時間（＋ランダム待機・GitHub側の遅延）で検知する。監視は「失効に早く気づく」ためのもので、失効から更新までの間に始まった配信は録画できない。完全に防ぐにはcookieの自動更新か、別の認証方式が必要。
+
+> `COOKIES_TXT` はログイン情報を含む。値やcookieファイルの中身をログ・Issue・READMEに書かない。
