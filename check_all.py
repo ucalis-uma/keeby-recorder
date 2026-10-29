@@ -63,7 +63,8 @@ def check_runtime_imports():
             "YT_DLP_PLUGIN_DIR", "YTDLP_PROXY", "ytdlp_base_cmd",
             "maybe_dispatch_next", "find_live_video_id",
             "extract_video_id", "get_video_state", "derive_stem",
-            "concat_segments", "probe_clients",
+            "concat_segments", "probe_clients", "get_stream_age_seconds",
+            "MAX_DVR_LAG_SECONDS",
         },
         "twitch_recorder.py": {
             "TEST_TARGET_URL", "TEST_MAX_SECONDS", "SKIP_UPLOAD",

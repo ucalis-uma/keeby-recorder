@@ -38,7 +38,7 @@ import socket
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -137,6 +137,15 @@ try:
     MAX_SEGMENTS = max(1, int(os.environ.get("MAX_SEGMENTS", "30") or "30"))
 except ValueError:
     MAX_SEGMENTS = 30
+
+# 配信開始からこの秒数以上経っている場合は DVR 先頭ではなくライブ端から録る。
+# （検知が数時間遅れたときに、数時間ぶんの遅延ダウンロードで job 上限に達するのを防ぐ）
+try:
+    MAX_DVR_LAG_SECONDS = max(
+        0, int(os.environ.get("MAX_DVR_LAG_SECONDS", "1800") or "1800")
+    )
+except ValueError:
+    MAX_DVR_LAG_SECONDS = 1800
 
 BASE_DIR = os.environ.get("KEEBY_BASE_DIR", os.getcwd())
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
@@ -448,6 +457,40 @@ def get_video_state(api_manager, video_id):
     details = item.get("liveStreamingDetails") or {}
     is_live = bool(details.get("actualStartTime")) and not details.get("actualEndTime")
     return (item.get("snippet") or {}).get("title"), is_live
+
+
+def get_stream_age_seconds(api_manager, video_id):
+    """配信開始からの経過秒数。判定できなければ None。
+
+    DVR 先頭から録るか、ライブ端から録るかの判断に使う（videos.list で 1 unit）。
+    """
+    if api_manager is None or not video_id:
+        return None
+    try:
+        def _call(yt):
+            return yt.videos().list(
+                part="liveStreamingDetails", id=video_id, maxResults=1
+            ).execute()
+
+        resp = api_manager.call(_call, f"videos.list(age:{video_id})")
+    except Exception as e:
+        logger.warning(f"配信開始時刻の取得に失敗: {type(e).__name__}: {e}")
+        return None
+
+    items = resp.get("items") or []
+    if not items:
+        return None
+    start = (items[0].get("liveStreamingDetails") or {}).get("actualStartTime")
+    if not start:
+        return None
+    try:
+        started = datetime.strptime(start, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        logger.warning(f"actualStartTime を解釈できません: {start!r}")
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - started).total_seconds())
 
 
 def _media_files(directory):
@@ -959,6 +1002,22 @@ def execute_scripts(live_url, cookies_file=None, api_manager=None):
         return strategies
 
     video_id = extract_video_id(live_url)
+    # 検知が遅れた配信で DVR 先頭から録ると、何時間も前から落とすことになり
+    # job の 6 時間上限に達して録画を失う。開始から一定時間を超えていたら
+    # ライブ端から録る（403 対策の --live-from-start は諦める）。
+    stream_age = get_stream_age_seconds(api_manager, video_id)
+    dvr_start = stream_age is None or stream_age <= MAX_DVR_LAG_SECONDS
+    if dvr_start:
+        logger.info(
+            "録画開始位置: DVR先頭"
+            + (f"（配信開始から {stream_age / 60:.0f} 分）" if stream_age is not None else "")
+        )
+    else:
+        logger.info(
+            f"録画開始位置: ライブ端（配信開始から {stream_age / 60:.0f} 分経過。"
+            f"MAX_DVR_LAG_SECONDS={MAX_DVR_LAG_SECONDS}）"
+        )
+
     started_at = time.time()
     stem = None
     segment = 1
@@ -976,7 +1035,7 @@ def execute_scripts(live_url, cookies_file=None, api_manager=None):
         segment_exit = None
         size_before = get_dir_size(DOWNLOAD_DIR)
         for index, (name, cmd) in enumerate(
-            build_strategies(out_template, from_start=(segment == 1))
+            build_strategies(out_template, from_start=(segment == 1 and dvr_start))
         ):
             if index > 0:
                 # 前のセグメントのファイルがあるため、増えたかどうかで判定する
@@ -1156,7 +1215,7 @@ def probe_clients(live_url, cookies_file=None):
         res = subprocess.run(
             ytdlp_base_cmd() + ["-v", "--simulate", "--no-warnings", live_url],
             capture_output=True,
-            timeout=180,
+            timeout=90,
         )
         text = (res.stdout + res.stderr).decode("utf-8", "replace")
         for line in text.splitlines():
@@ -1168,6 +1227,7 @@ def probe_clients(live_url, cookies_file=None):
     def cmd_for(use_cookies=False, extra=None):
         cmd = ytdlp_base_cmd() + [
             "--simulate", "--no-warnings", "--no-playlist",
+            "--socket-timeout", "10", "--retries", "1",
             "--print", "%(id)s|%(live_status)s|%(format_id)s",
         ]
         if not TEST_LIVE_URL:
@@ -1195,29 +1255,34 @@ def probe_clients(live_url, cookies_file=None):
 
     results = []
     for name, kwargs in candidates:
+        started = time.time()
         try:
-            res = subprocess.run(cmd_for(**kwargs), capture_output=True, timeout=180)
+            res = subprocess.run(cmd_for(**kwargs), capture_output=True, timeout=60)
         except subprocess.TimeoutExpired:
-            results.append((name, False, "timeout"))
+            results.append((name, False, "timeout", int(time.time() - started)))
             continue
+        secs = int(time.time() - started)
         ok = res.returncode == 0
         out = res.stdout.decode("utf-8", "replace").strip().splitlines()
         err = res.stderr.decode("utf-8", "replace").strip().splitlines()
         detail = (out[-1] if (ok and out) else (err[-1] if err else ""))[:160]
-        results.append((name, ok, detail))
+        results.append((name, ok, detail, secs))
 
     logger.info("===== PROBE RESULT =====")
-    for name, ok, detail in results:
-        logger.info(f"  [{'OK' if ok else 'NG'}] {name:<14} {detail}")
+    for name, ok, detail, secs in results:
+        logger.info(f"  [{'OK' if ok else 'NG'}] {name:<14} ({secs:>3}s) {detail}")
 
     # ライブが全滅しても、配信終了後の VOD なら保存できるか（後追いフォールバックの判断）
     vod_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
     try:
         res = subprocess.run(
             ytdlp_base_cmd()
-            + ["--simulate", "--no-warnings", "--print", "%(id)s|%(duration)s", vod_url],
+            + [
+                "--simulate", "--no-warnings", "--socket-timeout", "10",
+                "--retries", "1", "--print", "%(id)s|%(duration)s", vod_url,
+            ],
             capture_output=True,
-            timeout=180,
+            timeout=60,
         )
         vod_ok = res.returncode == 0
         vod_detail = (

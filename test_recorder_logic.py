@@ -354,7 +354,7 @@ class FakeProc:
         return 0
 
 
-def run_execute(live_sequence, max_bytes=0):
+def run_execute(live_sequence, max_bytes=0, age=None):
     """execute_scripts を依存スタブ付きで1回実行する。"""
     dl = pathlib.Path(recorder.DOWNLOAD_DIR)
     cm = pathlib.Path(recorder.COMMENTS_DIR)
@@ -380,6 +380,7 @@ def run_execute(live_sequence, max_bytes=0):
     orig = (
         recorder.run_with_watchdog,
         recorder.get_video_state,
+        recorder.get_stream_age_seconds,
         recorder.upload_with_rclone,
         recorder.concat_segments,
         recorder.cleanup_dir,
@@ -399,6 +400,7 @@ def run_execute(live_sequence, max_bytes=0):
 
     recorder.run_with_watchdog = fake_watchdog
     recorder.get_video_state = fake_state
+    recorder.get_stream_age_seconds = lambda m, v: age
     recorder.concat_segments = fake_concat
     recorder.upload_with_rclone = fake_upload
     recorder.cleanup_dir = lambda p: None
@@ -413,6 +415,7 @@ def run_execute(live_sequence, max_bytes=0):
     (
         recorder.run_with_watchdog,
         recorder.get_video_state,
+        recorder.get_stream_age_seconds,
         recorder.upload_with_rclone,
         recorder.concat_segments,
         recorder.cleanup_dir,
@@ -443,6 +446,13 @@ check("配信終了なら1セグメントで止める", calls["dl"] == 1, f"dl={
 
 status, calls, rec = run_execute([True, True, True], max_bytes=1024)
 check("サイズ上限に達したら継続しない", calls["dl"] == 1, f"dl={calls['dl']}")
+
+status, calls, rec = run_execute([False], age=7200)
+check(
+    "配信開始から2時間経過ならライブ端から録る（DVR先頭にしない）",
+    "--live-from-start" not in calls["cmds"][0],
+    calls["cmds"][0],
+)
 
 shutil.rmtree(TMP, ignore_errors=True)
 
