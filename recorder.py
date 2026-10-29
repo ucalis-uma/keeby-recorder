@@ -546,9 +546,11 @@ def maybe_dispatch_next(reason):
     try:
         import requests
 
+        # chain=1 を渡す。workflow_dispatch は schedule と同じ扱いにならないため、
+        # これが無いと次 job が「1回だけ・WARPなし・連鎖なし」で起動してしまう。
         res = requests.post(
             url,
-            json={"ref": ref},
+            json={"ref": ref, "inputs": {"chain": "1"}},
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.github+json",
@@ -790,12 +792,12 @@ def _read_text(path):
 
 
 def _is_cookie_error(text):
+    # "HTTP Error 403" はライブ端の未配信セグメントでも出るため含めない
     markers = (
         "cookies are no longer valid",
         "Sign in to confirm you",
         "Use --cookies-from-browser",
         "cookies for the authentication",
-        "HTTP Error 403",
     )
     return any(m in text for m in markers)
 
@@ -870,6 +872,9 @@ def execute_scripts(live_url, cookies_file=None, api_manager=None):
                 ("Cookie優先", make_video_cmd(out_template, use_cookies=True))
             )
         strategies += [
+            # 既定クライアントが DVR（--live-from-start）に対応しており、
+            # 実測でも 25分連続で安定して落ちた。まずこれを試す。
+            ("匿名", make_video_cmd(out_template)),
             (
                 "android_vr",
                 make_video_cmd(
@@ -891,7 +896,6 @@ def execute_scripts(live_url, cookies_file=None, api_manager=None):
                     extra=["--extractor-args", "youtube:player_client=tv_simply"],
                 ),
             ),
-            ("匿名", make_video_cmd(out_template)),
             (
                 "web_safari",
                 make_video_cmd(
@@ -1140,7 +1144,7 @@ def probe_clients(live_url, cookies_file=None):
         ]
         if not TEST_LIVE_URL:
             cmd.append("--live-from-start")
-        cmd += ["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"]
+        cmd += ["-f", "bv*+ba/b"]
         if extra:
             cmd += extra
         if use_cookies and cookies_file:

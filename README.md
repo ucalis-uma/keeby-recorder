@@ -37,7 +37,8 @@ github-actions/
 ├── setup_warp.sh                      # Cloudflare WARP（出口IPを変える）
 ├── setup_rclone.sh                    # Secrets から rclone.conf を生成
 ├── requirements.txt                   # Python 依存
-├── check_all.py                       # 開発用チェック（YAML/構文/文字化け）
+├── check_all.py                       # 開発用チェック（YAML/構文/文字化け/ロジックテスト）
+├── test_recorder_logic.py             # recorder.py のロジックテスト（通信なし）
 ├── .gitattributes                     # LF・UTF-8 固定
 ├── .gitignore                         # 録画データ・認証情報・venv を除外
 └── .github/workflows/
@@ -345,7 +346,8 @@ cron が一度も来ないまま終わる。これが「昨日配信があった
 ### 13-3. 動作確認
 
 - `python check_all.py` が `workflow_env` を含めて全PASS。
-- 偽API/偽yt-dlpでのロジックテスト19件（監視ループ、quotaフェイルオーバー、終了コード3/4/5、単発モード、セグメント継続）が全PASS。
+- `test_recorder_logic.py` の21件（監視ループ、quotaフェイルオーバー、終了コード3/4/5、
+  単発モード、セグメント継続、`--live-from-start` の有無）が全PASS。
 
 ### 13-4. 残る制約
 
@@ -480,3 +482,25 @@ WARP の IP も YouTube にブロックされることはあり得る。その�
 `Actions → YouTube Live Recorder → Run workflow` で `probe_only` を true にして実行すると、
 ダウンロードせずに各 player_client の可否だけを `PROBE RESULT` として出す。
 `use_warp` と組み合わせれば、WARP あり/なしの比較も1回でできる。
+
+### 13-9. WARP 導入後の 2.5GB テスト成功と、そこで見つかった「ライブ端 403」
+
+WARP を入れた直後の run #158 (`40922075004`, 2026-10-29 17:31〜18:06 UTC) は
+**2.5GB で正しく停止し、結合して Drive へアップロード完了**（`status=ok`）。
+
+ただし途中で別の不具合が出た。`--live-from-start` を付けない既定クライアントは DVR の先頭から
+ではなくライブ端から取り始め、`speed=1.16x` で先を読みに行く。まだ配信されていない
+セグメントを要求して **HTTP 403** になり、45〜60秒で終了していた。そのたびに
+セグメント継続が走り、1分の断片を30本（773MB）まで作っていた。
+
+**対策**
+
+- 先頭セグメントは常に `--live-from-start`（DVR の先頭から）。端に触れないので 403 が出ない
+- 2セグメント目以降は重複するため付けない
+- `HTTP Error 403` を Cookie 失効の判定材料から外した（未配信セグメントでも出るため）
+- 試行順を実測に合わせて `匿名 → android_vr → mweb → tv_simply → web_safari → web_embedded → tv → 緩い形式 → Cookie` に変更
+  - 既定クライアントが WARP 下で 25分連続して安定していたのが理由
+  - `android_vr` は formats が1本（301）しか返さず、長時間の連続取得に向かない
+
+この2点（セグメント継続と `--live-from-start`）は `test_recorder_logic.py` で固定してあり、
+`python check_all.py` が毎回検証する。

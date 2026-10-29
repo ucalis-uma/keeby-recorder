@@ -5,6 +5,7 @@
     python check_all.py
 """
 import ast
+import os
 import pathlib
 import re
 import sys
@@ -189,12 +190,56 @@ def check_workflow_runtime_env():
             for extra in ("setup_potoken.sh", "setup_warp.sh"):
                 if extra not in text:
                     missing.append(f"{extra}（YouTubeのアクセス経路）")
+        # 自己ディスパッチは workflow_dispatch になるため、chain=1 を見ないと
+        # 次 job が「監視0秒・自己ディスパッチなし」で起動して連鎖が切れる。
+        for extra in ("chain:", "inputs.chain == '1'"):
+            if extra not in text:
+                missing.append(f"{extra}（自己ディスパッチ連鎖）")
+        for key in ("WATCH_MAX_SECONDS:", "SELF_DISPATCH:"):
+            line = next((ln for ln in text.splitlines() if ln.strip().startswith(key)), "")
+            if "inputs.chain == '1'" not in line:
+                missing.append(f"{key} が chain を見ていない")
         if missing:
             print(f"  [FAIL] {name}: 不足 {missing}")
             ok = False
         else:
             print(f"  [OK] {name}: 監視ループ設定あり")
     return ok
+
+
+def check_logic_tests():
+    """recorder.py のロジックテストを実行する（通信なし・スタブ利用）。"""
+    print("=== Logic tests (recorder.py) ===")
+    script = ROOT / "test_recorder_logic.py"
+    if not script.exists():
+        print("  [FAIL] test_recorder_logic.py が見つかりません")
+        return False
+    import subprocess
+
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    res = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        cwd=str(ROOT),
+    )
+    lines = (res.stdout or "").splitlines()
+    fails = [ln for ln in lines if ln.startswith("FAIL ") or ln.startswith("FAILURES:")]
+    for ln in fails:
+        print("  [FAIL] " + ln)
+    passed = sum(1 for ln in lines if ln.startswith("PASS "))
+    if res.returncode != 0:
+        tail = (res.stderr or "").strip().splitlines()[-5:]
+        for ln in tail:
+            print("  " + ln)
+        print(f"  [FAIL] exit={res.returncode} ({passed} passed)")
+        return False
+    print(f"  [OK] {passed} checks passed")
+    return True
 
 
 def main():
@@ -204,6 +249,7 @@ def main():
         "python": check_python(),
         "runtime_names": check_runtime_imports(),
         "encoding": check_encoding(),
+        "logic": check_logic_tests(),
     }
     print("\n=== SUMMARY ===")
     for k, v in results.items():

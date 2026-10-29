@@ -45,6 +45,11 @@ on:
         required: false
         default: '0'
         type: string
+      chain:
+        description: '内部用: 自己ディスパッチの連鎖。手動では指定しない'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -91,9 +96,9 @@ jobs:
           TEST_MAX_SECONDS: ${{ inputs.test_max_seconds }}
           SKIP_UPLOAD: ${{ inputs.skip_upload && '1' || '' }}
           # --- 監視ループ設定（cronが15分間隔で来ない対策） ---
-          WATCH_MAX_SECONDS: ${{ github.event_name == 'schedule' && '14400' || inputs.watch_seconds }}
+          WATCH_MAX_SECONDS: ${{ (github.event_name == 'schedule' || inputs.chain == '1') && '14400' || inputs.watch_seconds }}
           POLL_INTERVAL: '180'
-          SELF_DISPATCH: ${{ github.event_name == 'schedule' && '1' || '0' }}
+          SELF_DISPATCH: ${{ (github.event_name == 'schedule' || inputs.chain == '1') && '1' || '0' }}
           SELF_WORKFLOW_FILE: twitch-recorder.yml
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPLOAD_RETRIES: '3'

@@ -165,9 +165,11 @@ def maybe_dispatch_next(reason):
     try:
         import requests
 
+        # chain=1 を渡す。workflow_dispatch は schedule と同じ扱いにならないため、
+        # これが無いと次 job が「1回だけ・連鎖なし」で起動してしまう。
         res = requests.post(
             url,
-            json={"ref": ref},
+            json={"ref": ref, "inputs": {"chain": "1"}},
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.github+json",

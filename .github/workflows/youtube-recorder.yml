@@ -62,6 +62,11 @@ on:
         required: false
         default: false
         type: boolean
+      chain:
+        description: '内部用: 自己ディスパッチの連鎖。手動では指定しない'
+        required: false
+        default: ''
+        type: string
 
 # 同時実行させない（前の録画中に次のcronが走って二重録画＆runner枠の消費を防ぐ）
 permissions:
@@ -93,11 +98,11 @@ jobs:
         # Cookie なしで player API を通すため。失敗しても警告のみで続行する。
         run: bash setup_potoken.sh
 
-      - name: Setup Cloudflare WARP (optional)
+      - name: Setup Cloudflare WARP
         # GitHub Actions の共有IPは YouTube に bot 扱いされるため、
         # 出口IPを変えたいときだけ使う。失敗しても直接接続で続行する。
-        # schedule 実行では常に有効（手動は use_warp=true のとき）。
-        if: ${{ github.event_name == 'schedule' || inputs.use_warp }}
+        # schedule / 自己ディスパッチの連鎖 / use_warp=true のいずれかで有効。
+        if: ${{ github.event_name == 'schedule' || inputs.chain == '1' || inputs.use_warp }}
         run: bash setup_warp.sh
 
       - name: Setup rclone (Google Drive)
@@ -137,13 +142,13 @@ jobs:
           SKIP_UPLOAD: ${{ inputs.skip_upload && '1' || '' }}
           MAX_DOWNLOAD_GB: ${{ inputs.max_download_gb }}
           PROBE_ONLY: ${{ inputs.probe_only && '1' || '' }}
-          YTDLP_PROXY: ${{ (github.event_name == 'schedule' || inputs.use_warp) && 'http://127.0.0.1:40000' || '' }}
+          YTDLP_PROXY: ${{ (github.event_name == 'schedule' || inputs.chain == '1' || inputs.use_warp) && 'http://127.0.0.1:40000' || '' }}
           # --- 監視ループ設定（cronが15分間隔で来ない対策） ---
-          # schedule 実行のみ 4時間ぶん監視し、終了時に次jobを自己起動する。
-          # 手動実行は inputs.watch_seconds（既定0=1回だけ）。
-          WATCH_MAX_SECONDS: ${{ github.event_name == 'schedule' && '14400' || inputs.watch_seconds }}
+          # schedule 実行と自己ディスパッチの連鎖（chain=1）では 4時間監視し、
+          # 終了時に次 job を自己起動する。手動実行は inputs.watch_seconds（既定0=1回だけ）。
+          WATCH_MAX_SECONDS: ${{ (github.event_name == 'schedule' || inputs.chain == '1') && '14400' || inputs.watch_seconds }}
           POLL_INTERVAL: '300'
-          SELF_DISPATCH: ${{ github.event_name == 'schedule' && '1' || '0' }}
+          SELF_DISPATCH: ${{ (github.event_name == 'schedule' || inputs.chain == '1') && '1' || '0' }}
           SELF_WORKFLOW_FILE: youtube-recorder.yml
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPLOAD_RETRIES: '3'
