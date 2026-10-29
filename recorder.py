@@ -864,6 +864,13 @@ def execute_scripts(live_url, cookies_file=None, api_manager=None):
                 ("Cookie優先", make_video_cmd(out_template, use_cookies=True))
             )
         strategies += [
+            (
+                "android_vr",
+                make_video_cmd(
+                    out_template,
+                    extra=["--extractor-args", "youtube:player_client=android_vr"],
+                ),
+            ),
             ("匿名", make_video_cmd(out_template)),
             (
                 "web_safari",
@@ -877,13 +884,6 @@ def execute_scripts(live_url, cookies_file=None, api_manager=None):
                 make_video_cmd(
                     out_template,
                     extra=["--extractor-args", "youtube:player_client=web_embedded"],
-                ),
-            ),
-            (
-                "android_vr",
-                make_video_cmd(
-                    out_template,
-                    extra=["--extractor-args", "youtube:player_client=android_vr"],
                 ),
             ),
             (

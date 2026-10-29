@@ -23,8 +23,12 @@ echo "[INFO] === PO Token provider (bgutil ${VERSION}) ==="
 mkdir -p "$PLUGIN_DIR"
 if curl -fsSL -o /tmp/bgutil.zip \
   "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/releases/download/${VERSION}/bgutil-ytdlp-pot-provider.zip"; then
-  unzip -oq /tmp/bgutil.zip -d "$PLUGIN_DIR"
-  echo "[INFO] plugin installed: ${PLUGIN_DIR}/yt_dlp_plugins"
+  # <plugins>/<name>/yt_dlp_plugins の形にする（yt-dlp の探索仕様）。
+  # 直下に置くと Plugin directories: none になり読み込まれない。
+  rm -rf "${PLUGIN_DIR}/bgutil"
+  mkdir -p "${PLUGIN_DIR}/bgutil"
+  unzip -oq /tmp/bgutil.zip -d "${PLUGIN_DIR}/bgutil"
+  echo "[INFO] plugin installed: ${PLUGIN_DIR}/bgutil/yt_dlp_plugins"
 else
   echo "::warning::PO token plugin の取得に失敗しました（Cookie フォールバックで続行）"
   exit 0
