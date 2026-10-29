@@ -3,12 +3,14 @@
 Keeby Twitch Live Recorder (GitHub Actions edition)
 
 旧VPSの twitch_dl_vps.py のActions版。
-無限ループ（while True）を外し、**1回のjobで完結**する:
 
-    配信検知 → (動画DL + チャットDL 並行) → 終了待ち → Google Driveへアップロード → 後始末 → 終了
+【重要】GitHub Actions の schedule は 15分間隔では走らない。
+公開リポジトリでは GitHub 側が schedule を間引くため、実測では
+1回あたり 3.2〜6.8時間（中央値 5.7時間）空く。そのため
+job 自体を監視ループにし、終了時に次 job を自己起動して監視を切らさない。
 
-15分ごとにcronで起動される前提。jobは6時間が上限だが、
-「配信中なら録画継続、終わったら終わる」ため6時間以内の配信なら収まる。
+    監視ループ → 配信検知 → (動画DL + チャットDL 並行)
+               → 終了待ち → Google Driveへアップロード → 次jobを起動
 """
 
 import os
@@ -52,6 +54,30 @@ GDRIVE_TWITCH_DEST = os.environ.get("GDRIVE_TWITCH_DEST", f"{RCLONE_REMOTE}:/kee
 STALL_TIMEOUT = int(os.environ.get("TWITCH_STALL_TIMEOUT", "1800"))  # 30分
 CHECK_INTERVAL = int(os.environ.get("TWITCH_CHECK_INTERVAL", "60"))    # 1分
 
+# --- 監視ループ（cronの間引き対策） ---
+try:
+    WATCH_MAX_SECONDS = int(os.environ.get("WATCH_MAX_SECONDS", "0") or "0")
+except ValueError:
+    WATCH_MAX_SECONDS = 0
+try:
+    POLL_INTERVAL = max(60, int(os.environ.get("POLL_INTERVAL", "180") or "180"))
+except ValueError:
+    POLL_INTERVAL = 180
+SELF_DISPATCH = os.environ.get("SELF_DISPATCH", "") == "1"
+SELF_WORKFLOW_FILE = os.environ.get("SELF_WORKFLOW_FILE", "")
+try:
+    MAX_CONSECUTIVE_API_ERRORS = int(os.environ.get("MAX_CONSECUTIVE_API_ERRORS", "5") or "5")
+except ValueError:
+    MAX_CONSECUTIVE_API_ERRORS = 5
+try:
+    UPLOAD_RETRIES = max(1, int(os.environ.get("UPLOAD_RETRIES", "3") or "3"))
+except ValueError:
+    UPLOAD_RETRIES = 3
+
+EXIT_API_ERROR = 3
+EXIT_UPLOAD_ERROR = 4
+EXIT_DOWNLOAD_ERROR = 5
+
 # --- テスト用（workflow_dispatch の inputs から注入。既定は本番動作） ---
 # TEST_TARGET_URL : 指定時は配信検知をスキップし、その URL を直接録画する
 # TEST_MAX_SECONDS : 指定時はその秒数で打ち切りドライラン終了する
@@ -81,16 +107,81 @@ def get_dir_size(path):
 
 
 def is_streaming():
-    """配信中か判定（yt-dlp --simulate）"""
+    """配信中か判定（yt-dlp --simulate）。
+
+    戻り値: True=配信中 / False=配信なし / None=判定失敗（エラー）
+    例外を False と区別できるようにして、API障害で黙って見逃さない。
+    """
     try:
         res = subprocess.run(
-            [YT_DLP_BIN, "--simulate", "--quiet", TARGET_URL],
+            [YT_DLP_BIN, "--simulate", "--quiet", "--no-warnings", TARGET_URL],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
-        return res.returncode == 0
     except FileNotFoundError:
         logger.error(f"{YT_DLP_BIN} が見つかりません。")
+        return None
+    except Exception as e:
+        logger.error(f"配信判定で例外: {type(e).__name__}: {e}")
+        return None
+
+    err = res.stderr.decode("utf-8", errors="replace").strip()
+    if res.returncode == 0:
+        return True
+    # オフライン（チャンネルが配信していない）は yt-dlp が非0で返す。
+    # ネットワーク/レート制限/その他の異常は判定失敗として扱う。
+    offline_markers = (
+        "not currently live",
+        "is offline",
+        "This channel is not currently live",
+        "No video formats found",
+        "Unable to find video",
+        "HTTP Error 404",
+    )
+    if any(m in err for m in offline_markers):
+        return False
+    if err:
+        logger.warning(f"配信判定の応答: {err[-500:]}")
+    return None
+
+
+def maybe_dispatch_next(reason):
+    """監視の切れ目で次の job を workflow_dispatch する（cron間引き対策）。
+
+    戻り値: True=起動した/不要, False=起動に失敗
+    """
+    if not SELF_DISPATCH:
+        return True
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    token = os.environ.get("GITHUB_TOKEN", "")
+    ref = os.environ.get("GITHUB_REF_NAME", "main")
+    if not (repo and token and SELF_WORKFLOW_FILE):
+        logger.error(
+            "自己ディスパッチの設定が不足しています "
+            f"(repo={bool(repo)}, token={bool(token)}, file={SELF_WORKFLOW_FILE!r})"
+        )
+        return False
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/{SELF_WORKFLOW_FILE}/dispatches"
+    try:
+        import requests
+
+        res = requests.post(
+            url,
+            json={"ref": ref},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=30,
+        )
+        if res.status_code in (201, 204):
+            logger.info(f"次の監視jobを起動しました（{reason}）。")
+            return True
+        logger.error(f"自己ディスパッチ失敗: {res.status_code} {res.text[:300]}")
+        return False
+    except Exception as e:
+        logger.error(f"自己ディスパッチ例外: {type(e).__name__}: {e}")
         return False
 
 
@@ -111,26 +202,39 @@ def cleanup_dir(path):
 
 
 def upload_to_drive():
-    """OUTPUT_DIR を Google Drive へアップロード。成功時のみローカル削除。"""
+    """OUTPUT_DIR を Google Drive へアップロード。成功時のみローカル削除。
+
+    失敗した場合は False を返し、呼び出し側で job を失敗させる（録画の消失を防ぐ）。
+    """
     import shutil as _shutil
 
     if _shutil.which(RCLONE_BIN) is None:
-        logger.warning(f"rclone が見つかりません（{RCLONE_BIN}）。アップロードをスキップします。")
+        logger.error(f"rclone が見つかりません（{RCLONE_BIN}）。アップロードできません。")
         return False
     time.sleep(3)  # rclone がファイルを確定するのを待つ
     cmd = [RCLONE_BIN, "copy", OUTPUT_DIR, GDRIVE_TWITCH_DEST, "--drive-chunk-size=64M"]
-    logger.info(f"Google Driveへアップロード: {' '.join(cmd)}")
-    try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    except FileNotFoundError:
-        logger.warning(f"rclone が見つかりません（{RCLONE_BIN}）。アップロードをスキップします。")
-        return False
-    if res.returncode == 0:
-        logger.info("アップロード完了。ローカルファイルを削除します。")
-        cleanup_dir(OUTPUT_DIR)
-        return True
-    out = res.stdout.decode("utf-8", errors="replace")[-2000:] if res.stdout else "(none)"
-    logger.warning(f"アップロード失敗(コード: {res.returncode})。ファイルは保持。出力: {out}")
+    for attempt in range(1, UPLOAD_RETRIES + 1):
+        logger.info(f"Google Driveへアップロード (試行 {attempt}/{UPLOAD_RETRIES}): {' '.join(cmd)}")
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except FileNotFoundError:
+            logger.error(f"rclone が見つかりません（{RCLONE_BIN}）。アップロードできません。")
+            return False
+        if res.returncode == 0:
+            logger.info("アップロード完了。ローカルファイルを削除します。")
+            cleanup_dir(OUTPUT_DIR)
+            return True
+        out = res.stdout.decode("utf-8", errors="replace")[-2000:] if res.stdout else "(none)"
+        logger.error(f"アップロード失敗(コード: {res.returncode})。出力: {out}")
+        low = out.lower()
+        if "storagequotaexceeded" in low or "quota" in low:
+            logger.error(
+                "Google Drive の空き容量が不足しています（storageQuotaExceeded）。"
+                "ドライブの整理 or プラン変更が必要です。"
+            )
+        if attempt < UPLOAD_RETRIES:
+            time.sleep(30)
+    logger.error("アップロードは全試行で失敗しました。ファイルは保持します。")
     return False
 
 
@@ -243,19 +347,37 @@ def record_and_upload(with_chat=True, target_url=None, max_seconds=0):
 
     if SKIP_UPLOAD:
         logger.info("SKIP_UPLOAD=1 のため Drive へ上げずローカル保持します（artifact で回収できます）。")
+        status = "ok"
     else:
-        upload_to_drive()
+        status = "ok" if upload_to_drive() else "upload_failed"
+        if status == "upload_failed":
+            logger.error(
+                "アップロードに失敗しました。録画ファイルは保持し、job を失敗させます"
+                "（artifact として退避します）。"
+            )
 
     if test_cutoff:
         logger.info("(テスト時間打ち切り — ドライラン正常終了)")
 
+    size = get_dir_size(OUTPUT_DIR)
+    if size == 0 and not test_cutoff:
+        logger.error("録画ファイルが0バイトです。録画に失敗しています。")
+        return "download_failed"
+    logger.info(f"録画サイクル完了 (status={status}, size={size / (1024 ** 2):.1f}MB)")
+    return status
+
 
 # ============================================================
-# エントリポイント（1回完結。旧VPS版の無限ループは持たない）
+# エントリポイント
 # ============================================================
 def main():
+    """監視ループ → 検知 → 録画 → アップロード。戻り値は終了コード。"""
     logger.info("===== Keeby Twitch Recorder (Actions版) 起動 =====")
     logger.info(f"対象: {TARGET_URL}")
+    logger.info(
+        f"監視モード: WATCH_MAX_SECONDS={WATCH_MAX_SECONDS} "
+        f"POLL_INTERVAL={POLL_INTERVAL} SELF_DISPATCH={int(SELF_DISPATCH)}"
+    )
     if TEST_TARGET_URL:
         logger.info(f"テストモード: TEST_TARGET_URL={TEST_TARGET_URL}")
     if TEST_MAX_SECONDS > 0:
@@ -273,13 +395,13 @@ def main():
         )
         if not have_chat:
             logger.warning(f"{CHAT_DOWNLOADER_BIN} が見つかりません。チャット保存なしで続行。")
-        record_and_upload(with_chat=have_chat, target_url=target_url, max_seconds=TEST_MAX_SECONDS)
+        status = record_and_upload(
+            with_chat=have_chat, target_url=target_url, max_seconds=TEST_MAX_SECONDS
+        )
         logger.info("テスト録画が完了しました。")
-        return
-
-    if not is_streaming():
-        logger.info("配信していません。何もしないで終了します。")
-        return
+        if status == "ok":
+            return 0
+        return EXIT_UPLOAD_ERROR if status == "upload_failed" else EXIT_DOWNLOAD_ERROR
 
     have_chat = (
         os.path.isfile(CHAT_DOWNLOADER_BIN)
@@ -288,9 +410,62 @@ def main():
     if not have_chat:
         logger.warning(f"{CHAT_DOWNLOADER_BIN} が見つかりません。チャット保存なしで続行。")
 
-    record_and_upload(with_chat=have_chat)
-    logger.info("終了処理完了。次回の起動はcronに任せる。")
+    # --- 監視ループ（cron は実測 中央値5.7時間間隔でしか来ない） ---
+    deadline = time.time() + WATCH_MAX_SECONDS if WATCH_MAX_SECONDS > 0 else 0
+    poll = 0
+    consecutive_errors = 0
+
+    while True:
+        poll += 1
+        logger.info(f"--- 監視ポーリング #{poll} ---")
+        streaming = is_streaming()
+
+        if streaming is None:
+            consecutive_errors += 1
+            logger.error(
+                f"配信判定に失敗 ({consecutive_errors}/{MAX_CONSECUTIVE_API_ERRORS})"
+            )
+            if consecutive_errors >= MAX_CONSECUTIVE_API_ERRORS:
+                logger.error("配信判定が連続失敗しました。ジョブを失敗させます。")
+                return EXIT_API_ERROR
+        else:
+            consecutive_errors = 0
+
+        if streaming:
+            logger.info("配信中を検知しました。録画を開始します。")
+            maybe_dispatch_next("配信検知時（job上限で切れた場合の保険）")
+            status = record_and_upload(with_chat=have_chat)
+            if status == "ok":
+                logger.info("録画とアップロードが完了しました。")
+                maybe_dispatch_next("録画完了後（監視を継続）")
+                return 0
+            if status == "upload_failed":
+                maybe_dispatch_next("アップロード失敗後の監視継続")
+                return EXIT_UPLOAD_ERROR
+            maybe_dispatch_next("録画失敗後の監視継続")
+            return EXIT_DOWNLOAD_ERROR
+
+        logger.info("配信していません。")
+        if deadline and time.time() >= deadline:
+            logger.info(
+                f"監視時間 {WATCH_MAX_SECONDS // 60}分が経過しました。"
+                "次の監視jobを起動して終了します。"
+            )
+            if not maybe_dispatch_next("監視時間の終了"):
+                logger.error("次jobを起動できませんでした。監視の連鎖が切れます。")
+                return EXIT_API_ERROR
+            return 0
+        if not deadline:
+            # 単発モード（手動実行の既定）。1回確認して終了する。
+            logger.info("監視時間が0のため1回だけ確認して終了します。")
+            return 0
+
+        sleep_seconds = POLL_INTERVAL
+        if deadline:
+            sleep_seconds = min(POLL_INTERVAL, max(10, int(deadline - time.time())))
+        logger.info(f"{sleep_seconds}秒後に再確認します。")
+        time.sleep(max(10, sleep_seconds))
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -3,20 +3,32 @@
 Keeby YouTube Live Recorder (GitHub Actions edition)
 
 旧VPS常時起動スクリプト (keeby-live-downloader.py) のActions版。
-while True ループを除き、**1回のjobで完結**する:
 
-    ライブ検知 → (動画DL + コメントDL 並行) → Google Driveへアップロード → 後始末 → 終了
+【重要】GitHub Actions の schedule は 15分間隔では走らない。
+公開リポジトリでは GitHub 側が schedule を間引くため、実測では
+1回あたり 3.5〜6.1時間（中央値 5.3時間）空く。そのため
+「15分ごとに起動して1回だけ見る」設計では配信を取りこぼす。
 
-15分ごとにcronで起動されるため、常時プロセスを持たず、PCの電源が入っていなくても録画できる。
+そこで job 自体を「監視ループ」にし、最大 WATCH_MAX_SECONDS の間
+POLL_INTERVAL ごとにライブを確認し続ける。監視時間を終えたら
+workflow_dispatch で次の job を自分で起動する（SELF_DISPATCH=1）ため、
+cron が間引かれても監視が途切れない。
 
-環境変数（すべて workflow の Secrets/Variables から与传统経由で注入）:
-    YOUTUBE_API_KEYS    : カンマ区切りのYouTube Data APIキー
-    COOKIES_FILE        : 書き出したcookies.txtのパス（403対策、任意）
-    RCLONE_REMOTE       : rcloneのリモート名（例: gdrive）
-    GDRIVE_VIDEO_DEST   : 動画のアップロード先
-    GDRIVE_COMMENT_DEST : コメントのアップロード先
-    KEEBY_BASE_DIR      : 作業ルート（既定: cwd）
-    YT_DLP_BIN          : yt-dlpのパス（既定: yt-dlp）
+    監視ループ → ライブ検知 → (動画DL + コメントDL 並行)
+               → Google Driveへアップロード → 後始末 → 次jobを起動
+
+環境変数（workflow の Secrets/Variables から注入）:
+    YOUTUBE_API_KEYS      : カンマ区切りのYouTube Data APIキー
+    COOKIES_FILE          : 書き出したcookies.txtのパス（403対策、任意）
+    RCLONE_REMOTE         : rcloneのリモート名（例: gdrive）
+    GDRIVE_VIDEO_DEST     : 動画のアップロード先
+    GDRIVE_COMMENT_DEST   : コメントのアップロード先
+    KEEBY_BASE_DIR        : 作業ルート（既定: cwd）
+    YT_DLP_BIN            : yt-dlpのパス（既定: yt-dlp）
+    WATCH_MAX_SECONDS     : 1 job の監視時間（既定 0=1回だけ）
+    POLL_INTERVAL         : 監視ループの間隔秒（既定 300）
+    SELF_DISPATCH         : "1" なら監視終了時に次 job を起動する
+    SELF_WORKFLOW_FILE    : 自己ディスパッチする workflow ファイル名
 """
 
 import os
@@ -62,6 +74,40 @@ CHANNEL_IDS = [
 STALL_TIMEOUT = 1800          # 30分間サイズ変化なしなら停滞(=配信終了)とみなす
 WATCHDOG_CHECK_INTERVAL = 60   # 1分ごとにサイズチェック
 
+# --- 監視ループ（cronの間引き対策） ---
+# GitHubのscheduleは15分間隔では走らない（実測 中央値5.3時間）。
+# job側でポーリングし続け、終了時に次jobを自己起動して監視を切らさない。
+try:
+    WATCH_MAX_SECONDS = int(os.environ.get("WATCH_MAX_SECONDS", "0") or "0")
+except ValueError:
+    WATCH_MAX_SECONDS = 0
+try:
+    POLL_INTERVAL = max(60, int(os.environ.get("POLL_INTERVAL", "300") or "300"))
+except ValueError:
+    POLL_INTERVAL = 300
+SELF_DISPATCH = os.environ.get("SELF_DISPATCH", "") == "1"
+SELF_WORKFLOW_FILE = os.environ.get("SELF_WORKFLOW_FILE", "")
+# 監視ループ内で API が全滅し続けたらジョブを失敗させる（緑のまま見逃さない）
+try:
+    MAX_CONSECUTIVE_API_ERRORS = int(os.environ.get("MAX_CONSECUTIVE_API_ERRORS", "5") or "5")
+except ValueError:
+    MAX_CONSECUTIVE_API_ERRORS = 5
+# search.list は 100 units と高いので、低コスト検知の補助として N ポーリングに1回だけ使う
+try:
+    SEARCH_FALLBACK_EVERY = max(1, int(os.environ.get("SEARCH_FALLBACK_EVERY", "24") or "24"))
+except ValueError:
+    SEARCH_FALLBACK_EVERY = 24
+# rclone のアップロード試行回数
+try:
+    UPLOAD_RETRIES = max(1, int(os.environ.get("UPLOAD_RETRIES", "3") or "3"))
+except ValueError:
+    UPLOAD_RETRIES = 3
+
+# 終了コード（workflow 側で job を赤くするために使う）
+EXIT_API_ERROR = 3       # API が連続失敗（quota/認証/ネットワーク）
+EXIT_UPLOAD_ERROR = 4    # 録画はできたが Drive へ上げられなかった
+EXIT_DOWNLOAD_ERROR = 5  # ライブは検知したが録画できなかった
+
 # --- テスト用（workflow_dispatch の inputs から注入。既定は本番動作） ---
 # TEST_LIVE_URL : 指定時は API 検知をスキップし、その URL を直接録画する
 # TEST_MAX_SECONDS : 指定時はその秒数で動画DLを打ち切りドライラン終了する
@@ -90,7 +136,19 @@ GDRIVE_COMMENT_DEST = os.environ.get(
 # ユーティリティ
 # ============================================================
 class YouTubeAPIManager:
-    """複数のAPIキーをフェイルオーバーで回す（VPS版と同一）"""
+    """複数のAPIキーをフェイルオーバーで回す。
+
+    旧実装は「1回呼んで失敗したら次のキーに切り替えるだけ」で、
+    同じ呼び出しを再試行しなかったため、quota 切れのキーに当たると
+    その回の検知は失敗したまま終わっていた。ここではキー数ぶん再試行する。
+    """
+
+    QUOTA_MARKERS = (
+        "quotaExceeded",
+        "dailyLimitExceeded",
+        "rateLimitExceeded",
+        "userRateLimitExceeded",
+    )
 
     def __init__(self, api_keys):
         self.api_keys = api_keys
@@ -100,12 +158,42 @@ class YouTubeAPIManager:
         ]
         if not self.youtube_clients:
             raise RuntimeError("YOUTUBE_API_KEYS が設定されていません。")
+        self.uploads_playlists = {}
 
     def get_current_client(self):
         return self.youtube_clients[self.current_key_index]
 
     def switch_to_next_key(self):
+        before = self.current_key_index
         self.current_key_index = (self.current_key_index + 1) % len(self.youtube_clients)
+        if len(self.youtube_clients) > 1:
+            logger.warning(f"APIキーを切り替えます: #{before} → #{self.current_key_index}")
+
+    @classmethod
+    def _is_quota_error(cls, err):
+        text = str(err)
+        return any(m in text for m in cls.QUOTA_MARKERS) or "quota" in text.lower()
+
+    def call(self, fn, what):
+        """API呼び出しをキー数ぶんリトライする。全滅したら例外を投げる。"""
+        last_error = None
+        for _ in range(len(self.youtube_clients)):
+            try:
+                return fn(self.get_current_client())
+            except HttpError as e:
+                last_error = e
+                if self._is_quota_error(e):
+                    logger.error(f"{what}: quota/rate limit に到達。次のキーで再試行します。")
+                    self.switch_to_next_key()
+                    continue
+                # 権限エラー等はキーを変えても無駄なので即座に送出
+                raise
+            except Exception as e:  # ネットワーク断など
+                last_error = e
+                logger.error(f"{what}: {type(e).__name__}: {e}")
+                self.switch_to_next_key()
+                continue
+        raise RuntimeError(f"{what}: すべてのAPIキーで失敗しました: {last_error}")
 
 
 def check_internet_connection():
@@ -189,36 +277,140 @@ def rescue_part_files(download_dir):
 # ============================================================
 # ライブ監視
 # ============================================================
-def check_live_status(api_manager, target_channel_id):
-    """対象チャンネルがライブ中ならvideoId、ライブでなければNone。"""
-    try:
-        if not check_internet_connection():
-            logger.warning("ネット未接続。")
-            return None
+def get_uploads_playlist_id(api_manager, channel_id):
+    """チャンネルの uploads プレイリストIDを取得（1 unit・job内でキャッシュ）。"""
+    cached = api_manager.uploads_playlists.get(channel_id)
+    if cached:
+        return cached
 
-        youtube = api_manager.get_current_client()
-        request = youtube.search().list(
+    def _call(yt):
+        return yt.channels().list(
+            part="contentDetails", id=channel_id, maxResults=1
+        ).execute()
+
+    resp = api_manager.call(_call, f"channels.list({channel_id})")
+    items = resp.get("items") or []
+    if not items:
+        raise RuntimeError(f"チャンネルが見つかりません: {channel_id}")
+    playlist_id = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+    api_manager.uploads_playlists[channel_id] = playlist_id
+    return playlist_id
+
+
+def find_live_video_id(api_manager, channel_id):
+    """uploads プレイリストの直近動画からライブ中のものを探す（合計2〜3 units）。
+
+    search.list(eventType=live) は 100 units/回で、5分ポーリングでは
+    1日でquotaを食い潰す。channels/playlistItems/videos は各1 unitで済む。
+    """
+    playlist_id = get_uploads_playlist_id(api_manager, channel_id)
+
+    def _items(yt):
+        return yt.playlistItems().list(
+            part="contentDetails", playlistId=playlist_id, maxResults=10
+        ).execute()
+
+    items = api_manager.call(_items, f"playlistItems.list({channel_id})").get("items") or []
+    video_ids = []
+    for item in items:
+        vid = (item.get("contentDetails") or {}).get("videoId")
+        if vid and vid not in video_ids:
+            video_ids.append(vid)
+    if not video_ids:
+        return None
+
+    def _videos(yt):
+        return yt.videos().list(
+            part="snippet,liveStreamingDetails",
+            id=",".join(video_ids),
+            maxResults=len(video_ids),
+        ).execute()
+
+    videos = api_manager.call(_videos, f"videos.list({channel_id})").get("items") or []
+    for video in videos:
+        details = video.get("liveStreamingDetails") or {}
+        # actualStartTime があって actualEndTime が無い = ライブ中
+        if details.get("actualStartTime") and not details.get("actualEndTime"):
+            return video["id"]
+    return None
+
+
+def search_live_video_id(api_manager, channel_id):
+    """補助用: search.list(eventType=live)。100 units なので低頻度でのみ使う。
+
+    uploads の直近10件に現れない長期配信（24時間配信など）を拾うための保険。
+    """
+    def _call(yt):
+        return yt.search().list(
             part="snippet",
-            channelId=target_channel_id,
+            channelId=channel_id,
             eventType="live",
             type="video",
             order="date",
             maxResults=1,
-        )
-        response = request.execute()
-        api_manager.switch_to_next_key()
+        ).execute()
 
-        if response["items"]:
-            return response["items"][0]["id"]["videoId"]
-        return None
-    except HttpError as e:
-        logger.error(f"API Error (Channel: {target_channel_id}): {e}")
-        api_manager.switch_to_next_key()
-        return None
+    resp = api_manager.call(_call, f"search.list({channel_id})")
+    items = resp.get("items") or []
+    if items:
+        return items[0]["id"]["videoId"]
+    return None
+
+
+def check_live_status(api_manager, target_channel_id, use_search_fallback=False):
+    """対象チャンネルがライブ中なら videoId、ライブでなければ None。"""
+    if not check_internet_connection():
+        raise RuntimeError("ネット未接続")
+    if use_search_fallback:
+        logger.info(f"  search.list で確認（補助・100units）: {target_channel_id}")
+        return search_live_video_id(api_manager, target_channel_id)
+    return find_live_video_id(api_manager, target_channel_id)
+
+
+# ============================================================
+# 自己ディスパッチ（cronの間引き対策）
+# ============================================================
+def maybe_dispatch_next(reason):
+    """監視の切れ目で次の job を workflow_dispatch する。
+
+    GitHub の schedule は公開リポジトリで大幅に間引かれる（実測 中央値5.3時間）。
+    監視ループの終了時に次 job を自分で起動することで、cron に依存せず監視を継続する。
+
+    戻り値: True=起動した/不要, False=起動に失敗（呼び出し側で job を失敗させる）
+    """
+    if not SELF_DISPATCH:
+        return True
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    token = os.environ.get("GITHUB_TOKEN", "")
+    ref = os.environ.get("GITHUB_REF_NAME", "main")
+    if not (repo and token and SELF_WORKFLOW_FILE):
+        logger.error(
+            "自己ディスパッチの設定が不足しています "
+            f"(repo={bool(repo)}, token={bool(token)}, file={SELF_WORKFLOW_FILE!r})"
+        )
+        return False
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/{SELF_WORKFLOW_FILE}/dispatches"
+    try:
+        import requests
+
+        res = requests.post(
+            url,
+            json={"ref": ref},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=30,
+        )
+        if res.status_code in (201, 204):
+            logger.info(f"次の監視jobを起動しました（{reason}）。")
+            return True
+        logger.error(f"自己ディスパッチ失敗: {res.status_code} {res.text[:300]}")
+        return False
     except Exception as e:
-        logger.error(f"Unknown error: {e}")
-        api_manager.switch_to_next_key()
-        return None
+        logger.error(f"自己ディスパッチ例外: {type(e).__name__}: {e}")
+        return False
 
 
 # ============================================================
@@ -360,20 +552,37 @@ def run_with_watchdog(command, watch_dir, label="process", max_seconds=0):
 # ============================================================
 # アップロード・後始末
 # ============================================================
-def upload_with_rclone(cmd):
-    """rclone アップロード。成功時 True。失敗・未検出時は例外を投げず False（jobは失敗させない）。"""
-    logger.info(f"rclone: {' '.join(cmd)}")
-    try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    except FileNotFoundError:
-        logger.warning(f"rclone が見つかりません（{cmd[0]}）。アップロードをスキップします。")
-        return False
-    if res.returncode != 0:
-        out = res.stdout.decode("utf-8", errors="replace")[-2000:] if res.stdout else "(none)"
-        logger.warning(f"rclone が失敗 (コード: {res.returncode})。出力: {out}")
-        return False
-    logger.info("rclone 完了。")
-    return True
+def upload_with_rclone(cmd, retries=None):
+    """rclone アップロード。成功時 True。失敗・未検出時は False（例外は投げない）。
+
+    Drive 満杯などの一時的でない失敗もあるため、リトライしつつ
+    最終的に失敗したら False を返して呼び出し側で job を失敗させる。
+    """
+    retries = UPLOAD_RETRIES if retries is None else retries
+    last_out = ""
+    for attempt in range(1, retries + 1):
+        logger.info(f"rclone (試行 {attempt}/{retries}): {' '.join(cmd)}")
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except FileNotFoundError:
+            logger.error(f"rclone が見つかりません（{cmd[0]}）。アップロードできません。")
+            return False
+        out = res.stdout.decode("utf-8", errors="replace") if res.stdout else ""
+        last_out = out
+        if res.returncode == 0:
+            logger.info("rclone 完了。")
+            return True
+        logger.error(f"rclone が失敗 (コード: {res.returncode})。出力: {out[-2000:]}")
+        low = out.lower()
+        if "storagequotaexceeded" in low or "quota" in low or "insufficient" in low:
+            logger.error(
+                "Google Drive の空き容量が不足しています（storageQuotaExceeded）。"
+                "ドライブの整理 or プラン変更が必要です。"
+            )
+        if attempt < retries:
+            time.sleep(30)
+    logger.error(f"rclone は {retries} 回失敗しました。最終出力: {last_out[-1000:]}")
+    return False
 
 
 def cleanup_dir(path):
@@ -389,10 +598,48 @@ def cleanup_dir(path):
         logger.warning(f"クリーンアップエラー {path}: {e}")
 
 
+def _read_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _is_cookie_error(text):
+    markers = (
+        "cookies are no longer valid",
+        "Sign in to confirm you",
+        "Use --cookies-from-browser",
+        "cookies for the authentication",
+        "HTTP Error 403",
+    )
+    return any(m in text for m in markers)
+
+
+def _strip_cookie_args(cmd):
+    """コマンドラインから --cookies <path> を取り除く。"""
+    out = []
+    skip_next = False
+    for arg in cmd:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--cookies":
+            skip_next = True
+            continue
+        out.append(arg)
+    return out
+
+
 # ============================================================
 # メイン録画処理（VPS版 execute_scripts を1回完結版に）
 # ============================================================
 def execute_scripts(live_url, cookies_file=None):
+    """録画〜アップロードを1回実行する。
+
+    戻り値: "ok" / "upload_failed" / "download_failed" / "no_data"
+    """
     logger.info(f"========== ライブ開始検出: {live_url} ==========")
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -436,6 +683,21 @@ def execute_scripts(live_url, cookies_file=None):
     video_exit = run_with_watchdog(
         video_cmd, DOWNLOAD_DIR, label="動画DL", max_seconds=TEST_MAX_SECONDS
     )
+
+    # --- Cookie 起因の失敗なら Cookie なしで1回だけ再試行 ---
+    # cookie-check.yml / cookie-canary.yml で失効を監視しているが、
+    # 失効直後や bot 判定でも「Cookieなしなら通る」ことがあるため保険を張る。
+    if video_exit not in (0, -1, -2) and get_dir_size(DOWNLOAD_DIR) == 0 and cookies_file:
+        stderr_text = _read_text(os.path.join(LOG_DIR, "ytdlp-video-stderr.log"))
+        if _is_cookie_error(stderr_text):
+            logger.warning("Cookie が無効/拒否されました。Cookie なしで再試行します。")
+            nolog_cmd = _strip_cookie_args(video_cmd)
+            video_exit = run_with_watchdog(
+                nolog_cmd,
+                DOWNLOAD_DIR,
+                label="動画DLcookieなし",
+                max_seconds=TEST_MAX_SECONDS,
+            )
 
     # --- 厳格フォーマットで失敗したら緩い指定で1回だけ再試行 ---
     # Shorts 等で mp4/m4a ペアが存在しない場合の救済。テスト打ち切り(-2)・
@@ -481,6 +743,7 @@ def execute_scripts(live_url, cookies_file=None):
             pass
 
     # --- アップロード前の結合保険 ---
+    status = "no_data"
     dl_size = get_dir_size(DOWNLOAD_DIR)
     if dl_size > 0:
         logger.info("[+] ダウンロード結果のチェック中...")
@@ -497,6 +760,7 @@ def execute_scripts(live_url, cookies_file=None):
                 f"SKIP_UPLOAD=1 のため Drive へ上げずローカル保持します "
                 f"(動画: {format_bytes(dl_size)}。artifact で回収できます)。"
             )
+            status = "ok"
         else:
             logger.info(f"Google Driveへアップロード中... (動画: {format_bytes(dl_size)})")
             ok_video = upload_with_rclone(
@@ -509,29 +773,41 @@ def execute_scripts(live_url, cookies_file=None):
                 cleanup_dir(DOWNLOAD_DIR)
                 cleanup_dir(COMMENTS_DIR)
                 logger.info("アップロード完了 & ローカル削除済み。")
+                status = "ok"
             else:
-                logger.warning(
-                    "アップロード不完全のためローカルは保持します（Drive 満杯時はここで止まります）。"
+                # ここで黙って緑にすると「録画はしたのにDriveに無い」が起きる。
+                # ローカルは残し、job を失敗させて artifact で回収できるようにする。
+                logger.error(
+                    "アップロードに失敗しました。録画ファイルは破棄せず保持します"
+                    "（job を失敗させ、artifact として退避します）。"
                 )
+                status = "upload_failed"
     else:
-        logger.warning("ダウンロードファイルが0バイトです。アップロードをスキップします。")
+        logger.error("ダウンロードファイルが0バイトです。録画に失敗しています。")
+        status = "download_failed"
 
     if video_exit == -1:
         logger.info("(ウォッチドッグにより停止 — 配信は正常に終了した可能性が高い)")
     elif video_exit == -2:
         logger.info("(テスト時間打ち切り — ドライラン正常終了)")
 
-    logger.info("========== 録画サイクル完了 ==========")
+    logger.info(f"========== 録画サイクル完了 (status={status}) ==========")
+    return status
 
 
 # ============================================================
-# エントリポイント（1回完結。旧VPS版の無限ループは持たない）
+# エントリポイント
 # ============================================================
 def main():
+    """監視ループ → 検知 → 録画 → アップロード。戻り値は終了コード。"""
     logger.info("===== Keeby YouTube Recorder (Actions版) 起動 =====")
     logger.info(f"監視チャンネル数: {len(CHANNEL_IDS)}")
     logger.info(f"ウォッチドッグタイムアウト: {STALL_TIMEOUT // 60}分")
     logger.info(f"開始時刻: {datetime.now().isoformat(timespec='seconds')}")
+    logger.info(
+        f"監視モード: WATCH_MAX_SECONDS={WATCH_MAX_SECONDS} "
+        f"POLL_INTERVAL={POLL_INTERVAL} SELF_DISPATCH={int(SELF_DISPATCH)}"
+    )
     if TEST_LIVE_URL:
         logger.info(f"テストモード: TEST_LIVE_URL={TEST_LIVE_URL}")
     if TEST_MAX_SECONDS > 0:
@@ -547,13 +823,13 @@ def main():
         if cookies_file and not os.path.exists(cookies_file):
             logger.warning(f"COOKIES_FILE が存在しません: {cookies_file}（Cookieなしで続行）")
             cookies_file = None
-        execute_scripts(TEST_LIVE_URL, cookies_file=cookies_file)
+        status = execute_scripts(TEST_LIVE_URL, cookies_file=cookies_file)
         logger.info("テスト録画が完了しました。")
-        return
+        return 0 if status == "ok" else EXIT_DOWNLOAD_ERROR
 
     if not API_KEYS:
         logger.error("YOUTUBE_API_KEYS が未設定です。")
-        sys.exit(2)
+        return 2
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     os.makedirs(COMMENTS_DIR, exist_ok=True)
@@ -570,27 +846,86 @@ def main():
     else:
         logger.info("COOKIES_FILE 未設定（Cookieなしで続行）")
 
-    # --- ライブチェック（各チャンネルを1回だけ。1つでも見つかれば録画） ---
-    found_live = False
-    for channel_id in CHANNEL_IDS:
-        logger.info(f"Checking: {channel_id}...")
-        live_id = check_live_status(api_manager, channel_id)
+    # --- 監視ループ ---
+    # cron は 15分間隔では来ない（実測 中央値5.3時間）。job 内でポーリングし、
+    # 監視時間を終えたら次 job を自己起動して切れ目を無くす。
+    deadline = time.time() + WATCH_MAX_SECONDS if WATCH_MAX_SECONDS > 0 else 0
+    poll = 0
+    consecutive_api_errors = 0
 
+    while True:
+        poll += 1
+        use_search = poll % SEARCH_FALLBACK_EVERY == 1
+        logger.info(f"--- 監視ポーリング #{poll} （search補助={use_search}） ---")
+
+        live_id = None
+        channel_errors = 0
+        for channel_id in CHANNEL_IDS:
+            try:
+                logger.info(f"Checking: {channel_id}...")
+                live_id = check_live_status(
+                    api_manager, channel_id, use_search_fallback=use_search
+                )
+            except Exception as e:
+                channel_errors += 1
+                logger.error(f"ライブ検知に失敗 ({channel_id}): {type(e).__name__}: {e}")
+                continue
+            if live_id:
+                break
+            logger.info("  → Liveなし")
+            time.sleep(1)
+
+        # --- 検知したら録画（次jobを保険として先に起動しておく） ---
         if live_id:
             url = f"https://www.youtube.com/watch?v={live_id}"
             logger.info(f"ライブ配信を検知: {url}")
-            execute_scripts(url, cookies_file=cookies_file)
-            found_live = True
-            break
-        logger.info("  → Liveなし")
-        time.sleep(1)
+            maybe_dispatch_next("ライブ検知時（job上限で切れた場合の保険）")
+            status = execute_scripts(url, cookies_file=cookies_file)
+            if status == "ok":
+                logger.info("録画とアップロードが完了しました。")
+                maybe_dispatch_next("録画完了後（監視を継続）")
+                return 0
+            if status == "upload_failed":
+                # Drive 満杯などで失敗しても監視自体は続ける（cron頼みにしない）。
+                maybe_dispatch_next("アップロード失敗後の監視継続")
+                return EXIT_UPLOAD_ERROR
+            maybe_dispatch_next("録画失敗後の監視継続")
+            return EXIT_DOWNLOAD_ERROR
 
-    if not found_live:
-        logger.info("どのチャンネルもライブ配信なし。何もしないで終了します。")
-    else:
-        logger.info("録画とコメント保存が完了しました。")
-    logger.info("終了処理完了。次回の起動はcronに任せる。")
+        # --- API が全チャンネルで失敗し続けたら赤くする（黙って見逃さない） ---
+        if channel_errors == len(CHANNEL_IDS):
+            consecutive_api_errors += 1
+            logger.error(
+                f"全チャンネルでライブ検知に失敗 ({consecutive_api_errors}/"
+                f"{MAX_CONSECUTIVE_API_ERRORS})"
+            )
+            if consecutive_api_errors >= MAX_CONSECUTIVE_API_ERRORS:
+                logger.error("API が連続失敗しました。ジョブを失敗させます。")
+                return EXIT_API_ERROR
+        else:
+            consecutive_api_errors = 0
+
+        # --- 監視時間の終了判定 ---
+        if deadline and time.time() >= deadline:
+            logger.info(
+                f"監視時間 {WATCH_MAX_SECONDS // 60}分が経過しました。"
+                "次の監視jobを起動して終了します。"
+            )
+            if not maybe_dispatch_next("監視時間の終了"):
+                logger.error("次jobを起動できませんでした。監視の連鎖が切れます。")
+                return EXIT_API_ERROR
+            return 0
+        if not deadline:
+            # 単発モード（手動実行の既定）。1回確認して終了する。
+            logger.info("監視時間が0のため1回だけ確認して終了します。")
+            return 0
+
+        sleep_seconds = POLL_INTERVAL
+        if deadline:
+            sleep_seconds = min(POLL_INTERVAL, max(10, int(deadline - time.time())))
+        logger.info(f"{sleep_seconds}秒後に再確認します。")
+        time.sleep(max(10, sleep_seconds))
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

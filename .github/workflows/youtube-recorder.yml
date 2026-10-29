@@ -7,7 +7,9 @@ name: YouTube Live Recorder
 # 「ライブ検知 → 録画 → Google Driveへアップロード」を1回のjobで完結させる。
 #
 # 設計上のポイント:
-#   * 15分間隔で起動。毎回1回だけ生存チェックしライブ中なら録画、なければ即終了。
+#   * GitHubのscheduleは15分間隔では来ない（実測 中央値5.3時間）。
+#     そのため job 自体が最大4時間ライブを監視し、終了時に次jobを自己起動する
+#     （WATCH_MAX_SECONDS / SELF_DISPATCH）。cronは連鎖が切れたときの保険。
 #   * cronの「:00」は実行が集中して遅延・dropが起きやすいため、意図的にずらしている。
 #   * timeout-minutes はActionsの6時間上限に少し余裕を持たせて350分(=約5.8時間)。
 #     （ユーザー前提: 1回のライブは6時間未満）
@@ -40,8 +42,18 @@ on:
         required: false
         default: false
         type: boolean
+      watch_seconds:
+        description: '手動実行時の監視秒数（0=1回だけ。本番はcronで自動設定）'
+        required: false
+        default: '0'
+        type: string
 
 # 同時実行させない（前の録画中に次のcronが走って二重録画＆runner枠の消費を防ぐ）
+permissions:
+  contents: read
+  actions: write   # 監視jobの自己ディスパッチ（cron間引き対策）に必要
+  issues: write    # 失敗時にIssueを作成して気づけるようにする
+
 concurrency:
   group: youtube-recorder
   cancel-in-progress: false
@@ -95,16 +107,26 @@ jobs:
           TEST_LIVE_URL: ${{ inputs.test_live_url }}
           TEST_MAX_SECONDS: ${{ inputs.test_max_seconds }}
           SKIP_UPLOAD: ${{ inputs.skip_upload && '1' || '' }}
+          # --- 監視ループ設定（cronが15分間隔で来ない対策） ---
+          # schedule 実行のみ 4時間ぶん監視し、終了時に次jobを自己起動する。
+          # 手動実行は inputs.watch_seconds（既定0=1回だけ）。
+          WATCH_MAX_SECONDS: ${{ github.event_name == 'schedule' && '14400' || inputs.watch_seconds }}
+          POLL_INTERVAL: '300'
+          SELF_DISPATCH: ${{ github.event_name == 'schedule' && '1' || '0' }}
+          SELF_WORKFLOW_FILE: youtube-recorder.yml
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPLOAD_RETRIES: '3'
         # setup_dependencies.sh が作った .venv の Python を使う
         # （PEP 668 のためシステム pip は使わない）。
         # COOKIES_FILE が存在しない場合 recorder.py 側で警告して継続する。
         run: .venv/bin/python recorder.py
-      - name: Fail on YouTube cookie errors
+      - name: Warn on YouTube cookie errors
+        # 録画は Cookie なし再試行で成功する場合もあるため、ここでは警告に留める。
+        # 実際の失敗は recorder.py の終了コード（3/4/5）で job を赤くする。
         if: always()
         run: |
           if [ -f logs/recorder.log ] && grep -qE "cookies are no longer valid|Sign in to confirm you" logs/recorder.log; then
-            echo "::error::YouTube cookies expired or invalid. Update COOKIES_TXT."
-            exit 1
+            echo "::warning::YouTube cookies expired or invalid. Update COOKIES_TXT."
           fi
       - name: Upload logs (for debugging)
         # 録画自体には不要だが、失敗時の調査用。artifact は小さいので問題なし。
@@ -114,6 +136,40 @@ jobs:
           name: recorder-logs
           path: ${{ github.workspace }}/logs
           retention-days: 7
+      - name: Upload recording as fallback (upload failed)
+        # Drive へ上げられなかった録画を artifact として退避する。
+        # ランナーは job 終了で消えるため、ここで救わないと録画が失われる。
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-fallback-recording
+          path: |
+            ${{ github.workspace }}/downloads
+            ${{ github.workspace }}/comments
+          retention-days: 3
+          if-no-files-found: warn
+      - name: Open issue on failure
+        # 失敗を通知する（放置で見逃さない）。
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="YouTube recorder job failed"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -z "$existing" ]; then
+            body=$(printf 'The YouTube recorder job failed.\n\nCheck the run:\n%s/%s/actions/runs/%s\n\nLogs are attached as the `recorder-logs` artifact. If the error is a Drive quota error, the recording is saved as `youtube-fallback-recording` (3 days).\n\nCommon causes:\n- `storageQuotaExceeded`: Google Drive is full\n- `cookies are no longer valid` / `Sign in to confirm you` : update `COOKIES_TXT`\n- `quotaExceeded`: YouTube API quota (add another key to `YOUTUBE_API_KEYS`)' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+      - name: Close issue on recovery
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="YouTube recorder job failed"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$GITHUB_REPOSITORY" --comment "Recovered: the recorder job succeeded."
+          fi
       - name: Upload test recording (dry-run only)
         # SKIP_UPLOAD=1 のドライラン時のみ。Drive に上げず artifact で回収する。
         if: ${{ inputs.skip_upload }}

@@ -7,7 +7,9 @@ name: Twitch Live Recorder
 # 「配信検知 → 録画＋チャット保存 → Google Driveへアップロード」を1回のjobで完結させる。
 #
 # 設計上のポイント:
-#   * 15分間隔で起動。毎回1回だけ生存チェックし配信中なら録画、なければ即終了。
+#   * GitHubのscheduleは15分間隔では来ない（実測 中央値5.7時間）。
+#     そのため job 自体が最大4時間配信を監視し、終了時に次jobを自己起動する
+#     （WATCH_MAX_SECONDS / SELF_DISPATCH）。cronは連鎖が切れたときの保険。
 #   * YouTube側と時刻をずらしたcronにして、両方同時に走らないようにしている。
 #   * timeout-minutes はActionsの6時間上限に少し余裕を持たせて350分(約5.8時間)。
 #   * public repo なので標準ランナーは無料・無制限・支払い方法登録も不要。
@@ -38,6 +40,16 @@ on:
         required: false
         default: false
         type: boolean
+      watch_seconds:
+        description: '手動実行時の監視秒数（0=1回だけ。本番はcronで自動設定）'
+        required: false
+        default: '0'
+        type: string
+
+permissions:
+  contents: read
+  actions: write   # 監視jobの自己ディスパッチ（cron間引き対策）に必要
+  issues: write    # 失敗時にIssueを作成して気づけるようにする
 
 concurrency:
   group: twitch-recorder
@@ -77,6 +89,13 @@ jobs:
           TEST_TARGET_URL: ${{ inputs.test_target_url }}
           TEST_MAX_SECONDS: ${{ inputs.test_max_seconds }}
           SKIP_UPLOAD: ${{ inputs.skip_upload && '1' || '' }}
+          # --- 監視ループ設定（cronが15分間隔で来ない対策） ---
+          WATCH_MAX_SECONDS: ${{ github.event_name == 'schedule' && '14400' || inputs.watch_seconds }}
+          POLL_INTERVAL: '180'
+          SELF_DISPATCH: ${{ github.event_name == 'schedule' && '1' || '0' }}
+          SELF_WORKFLOW_FILE: twitch-recorder.yml
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPLOAD_RETRIES: '3'
         run: .venv/bin/python twitch_recorder.py
 
       - name: Upload logs (for debugging)
@@ -86,6 +105,39 @@ jobs:
           name: twitch-recorder-logs
           path: ${{ github.workspace }}/logs
           retention-days: 7
+
+      - name: Upload recording as fallback (upload failed)
+        # Drive へ上げられなかった録画を artifact として退避する。
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: twitch-fallback-recording
+          path: ${{ github.workspace }}/twitch_temp
+          retention-days: 3
+          if-no-files-found: warn
+
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="Twitch recorder job failed"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -z "$existing" ]; then
+            body=$(printf 'The Twitch recorder job failed.\n\nCheck the run:\n%s/%s/actions/runs/%s\n\nLogs are attached as the `twitch-recorder-logs` artifact. If the error is a Drive quota error, the recording is saved as `twitch-fallback-recording` (3 days).\n\nCommon causes:\n- `storageQuotaExceeded`: Google Drive is full\n- yt-dlp error: check `ytdlp-twitch-stderr.log`' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+
+      - name: Close issue on recovery
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="Twitch recorder job failed"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$GITHUB_REPOSITORY" --comment "Recovered: the recorder job succeeded."
+          fi
 
       - name: Upload test recording (dry-run only)
         # SKIP_UPLOAD=1 のドライラン時のみ。Drive に上げず artifact で回収する。

@@ -57,9 +57,13 @@ def check_runtime_imports():
         "recorder.py": {
             "format_bytes", "datetime",
             "TEST_LIVE_URL", "TEST_MAX_SECONDS", "SKIP_UPLOAD",
+            "WATCH_MAX_SECONDS", "POLL_INTERVAL", "SELF_DISPATCH",
+            "maybe_dispatch_next", "find_live_video_id",
         },
         "twitch_recorder.py": {
             "TEST_TARGET_URL", "TEST_MAX_SECONDS", "SKIP_UPLOAD",
+            "WATCH_MAX_SECONDS", "POLL_INTERVAL", "SELF_DISPATCH",
+            "maybe_dispatch_next",
         },
     }
     for f in sorted(ROOT.glob("*.py")):
@@ -161,9 +165,34 @@ def check_encoding():
     return ok
 
 
+def check_workflow_runtime_env():
+    """cron間引き対策（監視ループ／自己ディスパッチ）の設定が消えていないか検査する。
+
+    GitHub の schedule は公開リポジトリで 15分間隔では来ない（実測 中央値 5.3〜5.7時間）。
+    その対策が workflow から抜けると配信を取りこぼすため、静的検査で固定する。
+    """
+    print("=== Workflow runtime env ===")
+    ok = True
+    targets = ["youtube-recorder.yml", "twitch-recorder.yml"]
+    for name in targets:
+        p = ROOT / ".github" / "workflows" / name
+        text = p.read_text(encoding="utf-8")
+        missing = [
+            key for key in ("WATCH_MAX_SECONDS:", "POLL_INTERVAL:", "SELF_DISPATCH:", "actions: write")
+            if key not in text
+        ]
+        if missing:
+            print(f"  [FAIL] {name}: 不足 {missing}")
+            ok = False
+        else:
+            print(f"  [OK] {name}: 監視ループ設定あり")
+    return ok
+
+
 def main():
     results = {
         "workflows": check_workflows(),
+        "workflow_env": check_workflow_runtime_env(),
         "python": check_python(),
         "runtime_names": check_runtime_imports(),
         "encoding": check_encoding(),

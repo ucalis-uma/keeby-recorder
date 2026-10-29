@@ -283,3 +283,69 @@ YouTubeのcookieは数週間〜数か月で失効する。失効中は録画が 
 > cookieの失効日時を事前に予測するものではない。失効後、最大約1時間（＋ランダム待機・GitHub側の遅延）で検知する。監視は「失効に早く気づく」ためのもので、失効から更新までの間に始まった配信は録画できない。完全に防ぐにはcookieの自動更新か、別の認証方式が必要。
 
 > `COOKIES_TXT` はログイン情報を含む。値やcookieファイルの中身をログ・Issue・READMEに書かない。
+
+---
+
+## 13. 2026-10-28 の配信を取りこぼした原因と対策
+
+### 13-1. 原因（実測）
+
+「15分間隔のcronで起動して1回だけライブを見る」設計が成立していなかった。
+GitHub Actions の `schedule` は、この公開リポジトリでは **15分間隔では実行されない**。
+Actions API の実行履歴（直近40件）を集計した実測値：
+
+| workflow | 実行間隔の最小 | 中央値 | 最大 | 30分以内の実行 |
+|---|---|---|---|---|
+| YouTube Live Recorder | 207分 | **318分（5.3時間）** | 366分 | 0 / 10 |
+| Twitch Live Recorder | 190分 | **342分（5.7時間）** | 408分 | 0 / 11 |
+
+つまり 96回/日 の予定が **約4〜5回/日** しか走っていない。実際、2026-10-28 の YouTube 側の実行は
+`00:03 / 05:25 / 11:31 / 17:17 / 21:42` の5回だけだった。配信がこの隙間に始まれば、
+cron が一度も来ないまま終わる。これが「昨日配信があったのに Drive に何も無い」の直接原因。
+
+補足：この日の実行はすべて success で、ログも `どのチャンネルもライブ配信なし` で終わっている。
+検知やアップロードのバグではなく、**見に行くタイミングが来ていなかった**。
+
+### 13-2. 対策
+
+1. **job 自体を監視ループにする**（`recorder.py` / `twitch_recorder.py`）
+   - `WATCH_MAX_SECONDS`（本番 14400秒=4時間）の間、`POLL_INTERVAL`（YouTube 300秒 / Twitch 180秒）ごとにライブを確認し続ける。
+   - ライブを検知したらその場で録画〜アップロードし、終了する。
+   - ライブが無いまま監視時間を終えたら 0 で終了する。
+   - `WATCH_MAX_SECONDS=0` は単発モード（手動実行の既定）。
+
+2. **監視の切れ目で次の job を自己起動する**（`SELF_DISPATCH=1`）
+   - 監視時間の終了時とライブ検知時に、REST API で `workflow_dispatch` を叩いて次 job を起動する。
+   - cron が何時間来なくても監視が途切れない。cron は「連鎖が切れたときの保険」になる。
+   - 必要な権限は `permissions: actions: write`。`GITHUB_TOKEN` を env で渡す。
+   - 同時実行は `concurrency` で1本に制限されるため、pending は最新1件に集約される。
+
+3. **ライブ検知を低コスト化**（`find_live_video_id`）
+   - `search.list(eventType=live)` は 100 units/回。5分ポーリングでは1日でquotaを食い潰す。
+   - `channels.list`（1 unit・job内キャッシュ）+ `playlistItems.list`（1 unit）+ `videos.list`（1 unit）で判定する。
+   - 直近10件のアップロードに現れない長期配信のために、24ポーリングに1回だけ `search.list` を補助使用（約2,400 units/日）。
+
+4. **APIキーのフェイルオーバーを実際に再試行する**（`YouTubeAPIManager.call`）
+   - 旧実装は1回失敗したらキーを替えるだけで、同じ呼び出しを再試行していなかった。
+   - 現在は quota/rate limit を検知したらキーを替えて同じ呼び出しを最大キー数ぶん再試行する。
+
+5. **失敗を緑のままにしない**
+   - API が全チャンネルで連続5回失敗 → exit 3
+   - 録画はできたが Drive へ上げられない → exit 4（ローカルは削除しない）
+   - ライブを検知したが録画が0バイト → exit 5
+   - workflow 側で `failure()` のとき録画を artifact（`youtube-fallback-recording` / `twitch-fallback-recording`、3日保持）へ退避する。
+   - 同様に `failure()` で Issue を作成し、次回 success で自動クローズする。
+
+6. **Cookie起因の録画失敗は Cookie なしで1回再試行**
+   - `cookies are no longer valid` / `Sign in to confirm you` 等を検出したら `--cookies` を外して再試行する。
+
+### 13-3. 動作確認
+
+- `python check_all.py` が `workflow_env` を含めて全PASS。
+- 偽API/偽yt-dlpでのロジックテスト20件（監視ループ、quotaフェイルオーバー、終了コード3/4/5、単発モード）が全PASS。
+
+### 13-4. 残る制約
+
+- 監視jobが4時間で終わるため、job上限（350分）に近い長さの配信では、録画がタイムアウトで切れる可能性がある。その場合、次jobがライブを再検知して `--live-from-start` で頭から取り直す（重複はrcloneが同名上書き）。
+- 監視の連鎖が何らかの理由で切れた場合に備え、cron はそのまま残している（`5,20,35,50` / `12,27,42,57`）。
+- 60日ルール対策の `keepalive.yml` も従来どおり必要。
