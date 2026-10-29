@@ -52,7 +52,8 @@ permissions:
   issues: write    # 失敗時にIssueを作成して気づけるようにする
 
 concurrency:
-  group: twitch-recorder
+  # 手動テスト（test_target_url 指定）は監視チェーンと別グループにする。
+  group: twitch-recorder-${{ (github.event_name == 'workflow_dispatch' && inputs.test_target_url != '') && 'manual' || 'auto' }}
   cancel-in-progress: false
 
 jobs:

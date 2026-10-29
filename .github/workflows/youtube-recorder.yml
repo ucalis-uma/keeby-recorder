@@ -60,7 +60,9 @@ permissions:
   issues: write    # 失敗時にIssueを作成して気づけるようにする
 
 concurrency:
-  group: youtube-recorder
+  # 手動テスト（test_live_url 指定）は監視チェーンと別グループにして、
+  # 4時間の監視jobが走っていても待たされないようにする。
+  group: youtube-recorder-${{ (github.event_name == 'workflow_dispatch' && inputs.test_live_url != '') && 'manual' || 'auto' }}
   cancel-in-progress: false
 
 jobs:
