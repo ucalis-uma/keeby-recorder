@@ -1295,7 +1295,7 @@ def probe_clients(live_url, cookies_file=None):
     logger.info(f"  [{'OK' if vod_ok else 'NG'}] {'VOD':<14} {vod_detail}")
     logger.info("=======================")
 
-    if not any(ok for _, ok, _ in results):
+    if not any(ok for _, ok, _, _ in results):
         logger.error("全経路が NG。PO Token provider か Cookie が必要です。")
         return EXIT_DOWNLOAD_ERROR
     return 0
