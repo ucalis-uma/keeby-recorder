@@ -96,7 +96,8 @@ jobs:
       - name: Setup Cloudflare WARP (optional)
         # GitHub Actions の共有IPは YouTube に bot 扱いされるため、
         # 出口IPを変えたいときだけ使う。失敗しても直接接続で続行する。
-        if: ${{ inputs.use_warp }}
+        # schedule 実行では常に有効（手動は use_warp=true のとき）。
+        if: ${{ github.event_name == 'schedule' || inputs.use_warp }}
         run: bash setup_warp.sh
 
       - name: Setup rclone (Google Drive)
@@ -136,7 +137,7 @@ jobs:
           SKIP_UPLOAD: ${{ inputs.skip_upload && '1' || '' }}
           MAX_DOWNLOAD_GB: ${{ inputs.max_download_gb }}
           PROBE_ONLY: ${{ inputs.probe_only && '1' || '' }}
-          YTDLP_PROXY: ${{ inputs.use_warp && 'http://127.0.0.1:40000' || '' }}
+          YTDLP_PROXY: ${{ (github.event_name == 'schedule' || inputs.use_warp) && 'http://127.0.0.1:40000' || '' }}
           # --- 監視ループ設定（cronが15分間隔で来ない対策） ---
           # schedule 実行のみ 4時間ぶん監視し、終了時に次jobを自己起動する。
           # 手動実行は inputs.watch_seconds（既定0=1回だけ）。
