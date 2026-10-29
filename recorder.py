@@ -836,10 +836,12 @@ def execute_scripts(live_url, cookies_file=None, api_manager=None):
     # （2026-10-29: HLS が一時的に ENDLIST を返し、配信継続中なのに 1.6GB で
     #   exit 0 した。exit 0 = 配信終了と決めつけると録画が途切れる。）
 
-    def make_video_cmd(out_template, use_cookies=False, extra=None, format_expr=None):
+    def make_video_cmd(out_template, use_cookies=False, extra=None, format_expr=None, from_start=False):
         cmd = ytdlp_base_cmd()
-        # テスト時は通常の動画URLでも落とせるよう --live-from-start を外す（本番は付与）。
-        if not TEST_LIVE_URL:
+        # ライブ端を先読みすると 403（未配信セグメント）で切れるため、
+        # 先頭セグメントは必ず DVR の先頭から取る。
+        # （テストで VOD URL を使う場合、このフラグは無視される）
+        if from_start:
             cmd.append("--live-from-start")
         cmd += [
             "--retries", "infinite",
@@ -856,7 +858,7 @@ def execute_scripts(live_url, cookies_file=None, api_manager=None):
         cmd.append(live_url)
         return cmd
 
-    def build_strategies(out_template):
+    def build_strategies(out_template, from_start=False):
         """匿名 → クライアント変更 → 緩い形式 → 最後に Cookie、の順で試す。
 
         Cookie は「あれば安定」ではなく、2026年は失効すると即エラーになる。
@@ -917,6 +919,11 @@ def execute_scripts(live_url, cookies_file=None, api_manager=None):
             strategies.append(
                 ("Cookieフォールバック", make_video_cmd(out_template, use_cookies=True))
             )
+        if from_start:
+            # 2セグメント目以降は DVR 先頭から取り直すと重複するため付けない
+            strategies = [
+                (name, cmd[:1] + ["--live-from-start"] + cmd[1:]) for name, cmd in strategies
+            ]
         return strategies
 
     video_id = extract_video_id(live_url)
@@ -936,7 +943,9 @@ def execute_scripts(live_url, cookies_file=None, api_manager=None):
 
         segment_exit = None
         size_before = get_dir_size(DOWNLOAD_DIR)
-        for index, (name, cmd) in enumerate(build_strategies(out_template)):
+        for index, (name, cmd) in enumerate(
+            build_strategies(out_template, from_start=(segment == 1))
+        ):
             if index > 0:
                 # 前のセグメントのファイルがあるため、増えたかどうかで判定する
                 if segment_exit in (0, -1, -2, -3) or get_dir_size(DOWNLOAD_DIR) > size_before:
