@@ -373,3 +373,27 @@ cron が一度も来ないまま終わる。これが「昨日配信があった
 
 > 2.5GB の取得には回線・配信ビットレートにより数十分かかる。
 > 途中経過は `recorder.log` の `[動画DL] DL中... サイズ:` で確認できる。
+
+### 13-6. 失敗通知（メール）が届かなかった原因と対策
+
+2026-10-29 の録画失敗時、Issue は自動作成されたがメールは届かなかった。原因は2つ。
+
+1. **Issue に担当者もメンションも無かった**
+   - GitHub のメール通知は「担当・メンション・購読」が条件。`GITHUB_TOKEN` が作っただけの Issue は誰にも紐づかず、メールは送られない。
+   - 対策：`gh issue create` に `--assignee "$GITHUB_REPOSITORY_OWNER"` を付け、本文にも `cc @<owner>` を入れた。
+2. **Cookie 失効そのものが検知されていなかった**
+   - `YouTube Cookie Check` は全51回 success。失効 Issue は一度も作られていない。
+   - `cookie_check.py login` は HTML の `"LOGGED_IN":true` しか見ておらず、
+     `Sign in to confirm you're not a bot`（player API の bot 判定）はログイン有効のまま起きるため検知できない。
+   - 対策：`cookie-check.yml` に yt-dlp を導入し、`cookie_check.py canary --attempts 1` を毎回実行する
+     `Check player access (bot detection)` ステップを追加した。
+   - 併せて、このワークフロー自体も GitHub の schedule 間引きで hourly ではなく
+     1日2〜3回しか動いていない（実測）。検知は最大でも数時間遅れる。
+
+メール通知を確実に受け取るには、GitHub 側の設定も必要：
+
+- `Settings → Notifications → Email` で、少なくとも **Assigned** と **Actions** を有効にする
+- メールアドレスが verified であること
+- リポジトリを Watch していること（`Watch → All Activity` または `Custom → Issues`）
+
+これらが揃っていれば、次回の失敗からは Issue 作成時にメールが届く。

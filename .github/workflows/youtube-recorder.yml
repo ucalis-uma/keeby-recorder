@@ -165,8 +165,8 @@ jobs:
           title="YouTube recorder job failed"
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
           if [ -z "$existing" ]; then
-            body=$(printf 'The YouTube recorder job failed.\n\nCheck the run:\n%s/%s/actions/runs/%s\n\nLogs are attached as the `recorder-logs` artifact. If the error is a Drive quota error, the recording is saved as `youtube-fallback-recording` (3 days).\n\nCommon causes:\n- `storageQuotaExceeded`: Google Drive is full\n- `cookies are no longer valid` / `Sign in to confirm you` : update `COOKIES_TXT`\n- `quotaExceeded`: YouTube API quota (add another key to `YOUTUBE_API_KEYS`)' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+            body=$(printf 'The YouTube recorder job failed.\n\nCheck the run:\n%s/%s/actions/runs/%s\n\nLogs are attached as the `recorder-logs` artifact. If the error is a Drive quota error, the recording is saved as `youtube-fallback-recording` (3 days).\n\nCommon causes:\n- `storageQuotaExceeded`: Google Drive is full\n- `cookies are no longer valid` / `Sign in to confirm you` : update `COOKIES_TXT`\n- `quotaExceeded`: YouTube API quota (add another key to `YOUTUBE_API_KEYS`)\n\ncc @%s' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY_OWNER")
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --assignee "$GITHUB_REPOSITORY_OWNER"
           fi
       - name: Close issue on recovery
         if: success()

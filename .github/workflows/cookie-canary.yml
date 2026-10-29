@@ -55,8 +55,8 @@ jobs:
           title="YouTube cookie canary failed"
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
           if [ -z "$existing" ]; then
-            body=$(printf 'The daily YouTube cookie canary failed.\n\nThis can mean expired cookies, bot verification, or a yt-dlp/JS runtime problem. Check the run log first, then update the `COOKIES_TXT` secret if needed:\nhttps://github.com/%s/settings/secrets/actions\n\nRun: %s/%s/actions/runs/%s' "$GITHUB_REPOSITORY" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+            body=$(printf 'The daily YouTube cookie canary failed.\n\nThis can mean expired cookies, bot verification, or a yt-dlp/JS runtime problem. Check the run log first, then update the `COOKIES_TXT` secret if needed:\nhttps://github.com/%s/settings/secrets/actions\n\nRun: %s/%s/actions/runs/%s\n\ncc @%s' "$GITHUB_REPOSITORY" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY_OWNER")
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --assignee "$GITHUB_REPOSITORY_OWNER"
           fi
 
       - name: Close issue on recovery

@@ -125,8 +125,8 @@ jobs:
           title="Twitch recorder job failed"
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
           if [ -z "$existing" ]; then
-            body=$(printf 'The Twitch recorder job failed.\n\nCheck the run:\n%s/%s/actions/runs/%s\n\nLogs are attached as the `twitch-recorder-logs` artifact. If the error is a Drive quota error, the recording is saved as `twitch-fallback-recording` (3 days).\n\nCommon causes:\n- `storageQuotaExceeded`: Google Drive is full\n- yt-dlp error: check `ytdlp-twitch-stderr.log`' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+            body=$(printf 'The Twitch recorder job failed.\n\nCheck the run:\n%s/%s/actions/runs/%s\n\nLogs are attached as the `twitch-recorder-logs` artifact. If the error is a Drive quota error, the recording is saved as `twitch-fallback-recording` (3 days).\n\nCommon causes:\n- `storageQuotaExceeded`: Google Drive is full\n- yt-dlp error: check `ytdlp-twitch-stderr.log`\n\ncc @%s' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY_OWNER")
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --assignee "$GITHUB_REPOSITORY_OWNER"
           fi
 
       - name: Close issue on recovery

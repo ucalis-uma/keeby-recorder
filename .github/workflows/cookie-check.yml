@@ -27,6 +27,16 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install yt-dlp and deno
+        # player API の bot 判定（Sign in to confirm you're not a bot）は
+        # HTML の LOGGED_IN:true では検知できないため、yt-dlp での確認に必要。
+        run: |
+          sudo curl -fsSL https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+          curl -fsSL https://deno.land/install.sh | sudo env DENO_INSTALL=/usr/local sh -s -- -y
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+          /usr/local/bin/yt-dlp --version
+
       - name: Random delay
         run: sleep $((RANDOM % 300))
 
@@ -38,20 +48,30 @@ jobs:
           printf '%s' "$COOKIES_TXT" > cookies.txt
           python cookie_check.py login --cookies cookies.txt --attempts 2
 
+      - name: Check player access (bot detection)
+        # ログインは有効でも player API が bot 判定される場合がある。
+        # 録画時と同じ yt-dlp 経路で1本だけ確認する。
+        id: player
+        env:
+          COOKIES_TXT: ${{ secrets.COOKIES_TXT }}
+        run: |
+          printf '%s' "$COOKIES_TXT" > cookies.txt
+          python cookie_check.py canary --cookies cookies.txt --attempts 1
+
       - name: Open issue on failure
-        if: failure() && steps.check.outcome == 'failure'
+        if: failure() && (steps.check.outcome == 'failure' || steps.player.outcome == 'failure')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           title="YouTube cookie session check failed"
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
           if [ -z "$existing" ]; then
-            body=$(printf 'The hourly YouTube cookie session check failed.\n\nUpdate the `COOKIES_TXT` secret with a fresh export:\nhttps://github.com/%s/settings/secrets/actions\n\nRun: %s/%s/actions/runs/%s' "$GITHUB_REPOSITORY" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+            body=$(printf 'The hourly YouTube cookie check failed.\n\nUpdate the `COOKIES_TXT` secret with a fresh export:\nhttps://github.com/%s/settings/secrets/actions\n\nRun: %s/%s/actions/runs/%s\n\nIf the log says `Sign in to confirm you'"'"'re not a bot`, the cookies are stale/bot-blocked even when `LOGGED_IN:true`.\n\ncc @%s' "$GITHUB_REPOSITORY" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY_OWNER")
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --assignee "$GITHUB_REPOSITORY_OWNER"
           fi
 
       - name: Close issue on recovery
-        if: success() && steps.check.outcome == 'success'
+        if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
