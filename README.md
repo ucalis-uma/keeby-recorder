@@ -33,17 +33,17 @@ github-actions/
 ├── recorder.py                        # YouTube録画（1回のjobで完結）
 ├── twitch_recorder.py                 # Twitch録画（1回のjobで完結）
 ├── setup_dependencies.sh              # 依存インストール（yt-dlp/deno/ffmpeg/rclone/pip）
+├── setup_potoken.sh                   # PO Token provider（bgutil）の導入
+├── setup_warp.sh                      # Cloudflare WARP（出口IPを変える）
 ├── setup_rclone.sh                    # Secrets から rclone.conf を生成
 ├── requirements.txt                   # Python 依存
 ├── check_all.py                       # 開発用チェック（YAML/構文/文字化け）
-├── cookie_check.py                    # Cookie検査（ログイン確認 / canary）
 ├── .gitattributes                     # LF・UTF-8 固定
 ├── .gitignore                         # 録画データ・認証情報・venv を除外
 └── .github/workflows/
     ├── youtube-recorder.yml           # YouTube用 cron ジョブ
     ├── twitch-recorder.yml            # Twitch用 cron ジョブ
-    ├── cookie-check.yml               # 毎時のcookieログイン確認
-    ├── cookie-canary.yml              # 日次のcookie canary
+    ├── access-check.yml               # 週1の疎通確認（WARP + PO Token）
     └── keepalive.yml                  # 60日ルール対策（毎日 空コミット push）
 ```
 
@@ -117,7 +117,7 @@ github-actions/
 3. ログに以下が出ればOK：
    - ライブ中なら `ライブ配信を検知: https://...` → 録画 → `Google Driveへアップロード中` → `アップロード完了`
    - ライブ無しなら `どのチャンネルもライブ配信なし。何もしないで終了します。`
-4. cookieを更新したら、`YouTube Cookie Check` と `YouTube Cookie Canary` も手動実行し、両方successになることを確認する。
+4. 経路を変えたときは `Actions → YouTube Access Check → Run workflow` で疎通確認する（週1でも自動実行される）。
 
 > **注意**: 実チャンネルがライブ中じゃないと「動画DL」には入らない。手動テスト時は一時的に `CHANNEL_IDS` を
 > ライブ中のチャンネルIDに変更するか、`workflow_dispatch` でそのまま実行してログの挙動を確かめること。
@@ -131,8 +131,7 @@ GitHub公式ドキュメントに「**毎時0分は実行が集中し、遅延�
 
 - YouTube: `5,20,35,50 * * * *`（15分間隔、`:00` を回避）
 - Twitch: `12,27,42,57 * * * *`（15分間隔、YouTube側と時刻をずらす）
-- cookie-check: `17 * * * *`（毎時17分。実行後に0〜5分のランダム待機）
-- cookie-canary: `43 4 * * *`（毎日4:43 UTC＝13:43 JST。実行後に0〜10分のランダム待機）
+- access-check: `23 4 * * 1`（毎週月曜4:23 UTC。週1の疎通確認）
 - keepalive: `12 3 * * *`（毎日3:12）
 
 > 注意: GitHub Actions の cron は5フィールド必須（分 時 日 月 曜日）。
@@ -153,8 +152,9 @@ GitHub公式ルール「**public リポジトリは60日アクティビティ無
 
 | 項目 | 旧VPS | 現在のActions |
 |---|---|---|
-| 常駐プロセス | systemd で常時起動 | 15分ごとの単発ジョブ |
-| 無限ループ | `while True` で15分待機しながら継続 | 1回検知して、あれば録画、無ければ即終了 |
+| 常駐プロセス | systemd で常時起動 | job内の監視ループ（最大4時間）＋終了時に次jobを自己起動 |
+| 検知間隔 | 15分ごと | 監視中は YouTube 5分 / Twitch 3分 |
+| 出口IP | VPSの固定IP | GitHubの共有IP（bot判定されるため WARP 経由。13-8） |
 | ファイル保存 | `/root/keeby/downloads` に一時保存 | ランナー内 `/home/runner/work/.../downloads`（ephemeral） |
 | 保存先 | rclone で Google Drive | 同じ（変更なし） |
 | メモリ／スワップ | 2GB + 4GB swap | 16GB（ランナー標準。swap不要） |
@@ -248,40 +248,42 @@ SMALL（短い動画・テスト用URL）を選ぶと artifact も小さく済�
 
 ---
 
-## 12. Cookie監視（cookie-check / cookie-canary）
+## 12. アクセス監視（access-check）
 
-YouTubeのcookieは数週間〜数か月で失効する。失効中は録画が `Sign in to confirm you're not a bot` などで失敗するが、従来は録画開始時まで気づけず、Jobもsuccess扱いになることがあった。現在は次の3段階で検知する。
+### 12-1. Cookie 巡回は廃止した
 
-### 12-1. 毎時のログイン確認（cookie-check.yml）
+以前は `cookie-check.yml`（毎時）と `cookie-canary.yml`（日次）で、ログイン済み
+Cookie を使って `/feed/subscriptions` や `/feed/history` を巡回していた。廃止理由は2つ。
 
-- 毎時17分に起動し、0〜5分のランダム待機後に1回だけ実行する。
-- `cookie_check.py login` が12個のURL（登録チャンネル、履歴、ライブラリ、後で見る、高評価、ホーム、急上昇、アカウント、コース、m.youtube版）から最大2個をランダムに選ぶ。
-- cookie付きHTTP GETのHTMLに `"LOGGED_IN":true` があるかだけを見る。動画のplayer APIは叩かない。
-- 失敗時はIssue `YouTube cookie session check failed` を作成し、Jobを失敗させる。次回成功時に自動クローズする。
-- Issue通知はリポジトリのIssues機能を使う。無効だとIssue作成ステップで失敗する（Job自体も失敗する）。
-- URL・User-Agent・待機時間を毎回変え、固定パターンのアクセスを避ける。
+- ログイン済みアカウントで feed を機械的に巡回するのは scraper そのもので、
+  Google のリスクスコアを上げる。同じセッションを消耗するため、
+  Cookie の失効を早めている疑いがあった。
+- 2026-10-29 の実測で、**Cookie を付けても GitHub Actions の IP では
+  `Sign in to confirm you're not a bot` で全滅**した。Cookie の鮮度は
+  ボトルネックではなかった（詳細は 13-8）。
 
-### 12-2. 日次canary（cookie-canary.yml）
+### 12-2. 週1回の疎通確認（access-check.yml）
 
-- 毎日4:43 UTC（13:43 JST）に起動し、0〜10分のランダム待機後に実行する。
-- nightly yt-dlpとdenoを導入し、`cookie_check.py canary` が31本の公開動画リストから最大5本をランダムに選ぶ。
-- 各動画に `yt-dlp --simulate --cookies cookies.txt` を実行し、cookieで実際にメタデータ・フォーマットを取得できるか確認する。非公開・地域制限などで失敗した動画は読み飛ばす。
-- cookie失効・bot判定を検知したらIssue `YouTube cookie canary failed` を作成する。
-- 軽量チェックが通っても、player API側でだけ失敗する場合をここで拾う。
+- 毎週月曜 04:23 UTC に1回だけ実行する。
+- 本番とまったく同じ経路（WARP → yt-dlp → PO Token provider）で
+  `recorder.py` の PROBE モードを回し、各 player_client の可否をログに出す。
+- 失敗したときだけ Issue `YouTube access check failed` を作成する
+  （assignee と cc 付きなのでメールが飛ぶ）。復旧時に自動クローズする。
+- ログは artifact `access-check-logs` に14日保存する。
 
-### 12-3. 録画時の失敗検知（youtube-recorder.yml）
+### 12-3. 録画時の失敗検知
 
-- 録画後に `logs/recorder.log` を検査し、`cookies are no longer valid` または `Sign in to confirm you're not a bot` があればJobを失敗させる。
-- これにより「録画に失敗したのにJobはsuccess」という状態をなくす。ログは従来どおりartifact `recorder-logs` に残る。
+- `recorder.py` は API 連続失敗=3 / アップロード失敗=4 / 録画失敗=5 で終了する。
+- workflow は `failure()` で Issue を作成し、録画を artifact に退避する。
+- ログの `cookies are no longer valid` は警告に留める（Cookie なし再試行で
+  成功する場合があるため）。
 
-### 12-4. cookieを更新するとき
+### 12-4. Cookie はもう必須ではない
 
-1. ブラウザでYouTubeにログインし、Netscape形式のcookieを再取得する。
-2. GitHubの `Settings → Secrets and variables → Actions` で `COOKIES_TXT` を更新する。
-3. `Actions → YouTube Cookie Check → Run workflow` と `Actions → YouTube Cookie Canary → Run workflow` を手動実行する。
-4. 両方successになり、open中のcookie Issueが自動クローズされれば完了。
-
-> cookieの失効日時を事前に予測するものではない。失効後、最大約1時間（＋ランダム待機・GitHub側の遅延）で検知する。監視は「失効に早く気づく」ためのもので、失効から更新までの間に始まった配信は録画できない。完全に防ぐにはcookieの自動更新か、別の認証方式が必要。
+- 既定は「匿名（android_vr → mweb → tv_simply → …）→ 最後に Cookie」の順。
+- `COOKIES_TXT` は保険として残してあるが、更新しなくても録画は動く。
+- 更新する場合: Secrets の `COOKIES_TXT` を差し替え、
+  `Actions → YouTube Access Check → Run workflow` で疎通確認する。
 
 > `COOKIES_TXT` はログイン情報を含む。値やcookieファイルの中身をログ・Issue・READMEに書かない。
 
@@ -363,6 +365,8 @@ cron が一度も来ないまま終わる。これが「昨日配信があった
 | `test_max_seconds` | `0` | 時間ではなくサイズで打ち切る |
 | `skip_upload` | **false**（チェックしない） | 実際に Drive へアップロードする |
 | `max_download_gb` | `2.5` | 約2.5GBに達したら SIGINT で停止し、結合後にアップロード |
+| `use_warp` | **true** | Cloudflare WARP 経由にする（本番の schedule は常時有効） |
+| `probe_only` | false | true にすると DL せず経路の可否だけ確認する |
 
 - `test_max_seconds` と `max_download_gb` は併用でき、先に達した方で打ち切る。
 - サイズ上限で止めた場合は終了コード -3 として扱い、**失敗ではなく正常な打ち切り**（そのままアップロードへ進む）。
@@ -383,12 +387,10 @@ cron が一度も来ないまま終わる。これが「昨日配信があった
    - 対策：`gh issue create` に `--assignee "$GITHUB_REPOSITORY_OWNER"` を付け、本文にも `cc @<owner>` を入れた。
 2. **Cookie 失効そのものが検知されていなかった**
    - `YouTube Cookie Check` は全51回 success。失効 Issue は一度も作られていない。
-   - `cookie_check.py login` は HTML の `"LOGGED_IN":true` しか見ておらず、
+   - 旧 `cookie_check.py login` は HTML の `"LOGGED_IN":true` しか見ておらず、
      `Sign in to confirm you're not a bot`（player API の bot 判定）はログイン有効のまま起きるため検知できない。
-   - 対策：`cookie-check.yml` に yt-dlp を導入し、`cookie_check.py canary --attempts 1` を毎回実行する
-     `Check player access (bot detection)` ステップを追加した。
-   - 併せて、このワークフロー自体も GitHub の schedule 間引きで hourly ではなく
-     1日2〜3回しか動いていない（実測）。検知は最大でも数時間遅れる。
+   - その後、原因は Cookie の鮮度ではなく **ランナーのIP** だと判明した（13-8）。
+     毎時のログイン巡回は廃止し、週1回の `access-check.yml` が本番経路の疎通だけを見る。
 
 メール通知を確実に受け取るには、GitHub 側の設定も必要：
 
@@ -420,3 +422,61 @@ cron が一度も来ないまま終わる。これが「昨日配信があった
 - セグメント上限は `MAX_SEGMENTS`（既定30）
 
 この確認は player API ではなく Data API なので、bot 判定の材料にならない。
+
+### 13-8. GitHub Actions の IP が YouTube にブロックされる問題（2026-10-29 実測）
+
+#### 何が起きたか
+
+同じ URL・同じ yt-dlp で、実行場所だけを変えた結果：
+
+| 実行場所 | 結果 |
+|---|---|
+| 手元（住宅IP） | 匿名で即 OK（`is_live / 301`） |
+| GitHub Actions のランナー | Cookie ありでも `Sign in to confirm you're not a bot` |
+| 同上（PO Token provider 導入後） | まだ NG |
+| 同上（Cloudflare WARP 経由） | **全経路 OK** |
+
+原因は Cookie でも yt-dlp でもなく、**ランナーの共有IPの評判**。GitHub Actions の IP は
+大量のスクレイパーと共有されており、YouTube から見ると常に bot に近い。
+Cookie の鮮度を上げても解決しない。
+
+ランナーは毎回別のIPが割り当てられるため、**たまたま通る回がある**（14:39 の録画成功、
+16:24 の `android_vr` 成功）。これが「動くときと動かないときがある」の正体。
+
+#### 対策
+
+1. **WARP で出口IPを変える（既定で有効）**
+   - `setup_warp.sh` が Cloudflare WARP をプロキシモード（`127.0.0.1:40000`）で起動する。
+   - TUN を作らないので、ランナーでも権限問題が起きにくい。
+   - schedule 実行では常に有効。手動実行は `use_warp` を true にする。
+   - 実測：WARP 経由にした瞬間、bot 壁が消えて `android_vr` / `mweb` / `tv_simply` /
+     `web_embedded` / VOD がすべて通った。
+   - 失敗してもジョブは止めず、直接接続にフォールバックする。
+
+2. **PO Token provider（保険）**
+   - `setup_potoken.sh` が `bgutil-ytdlp-pot-provider` の yt-dlp プラグインと
+     Docker の provider（`127.0.0.1:4416`）を入れる。
+   - プラグインは `<plugins>/<name>/yt_dlp_plugins` に置く。直下に置くと
+     `Plugin directories: none` になり読み込まれない（実測）。
+   - yt-dlp のスタンドアロンバイナリは既定の config ディレクトリを拾わないことが
+     あるため、`--plugin-dirs` を明示している。
+
+3. **Cookie は最後のフォールバック**
+   - 戦略の最後にだけ置く。失効していても匿名経路で録画できる。
+
+#### それでもダメな場合
+
+WARP の IP も YouTube にブロックされることはあり得る。その場合は
+**専用IPを持つホストに移す**のが確実。
+
+| 案 | コスト | 特徴 |
+|---|---|---|
+| Oracle Cloud Always Free（ARM VM） | 0円 | 24/7・専用IP。無料枠の範囲で動く |
+| 格安VPS（Xserver VPS 等） | 月500円〜 | 旧VPSで実績あり。本リポジトリのスクリプトを流用できる |
+| 自宅の常時起動PC / Raspberry Pi | 1〜2万円（初期） | 住宅IPなので bot 判定がほぼ無い。最も確実 |
+
+#### 経路の実測方法
+
+`Actions → YouTube Live Recorder → Run workflow` で `probe_only` を true にして実行すると、
+ダウンロードせずに各 player_client の可否だけを `PROBE RESULT` として出す。
+`use_warp` と組み合わせれば、WARP あり/なしの比較も1回でできる。

@@ -185,8 +185,10 @@ def check_workflow_runtime_env():
             key for key in ("WATCH_MAX_SECONDS:", "POLL_INTERVAL:", "SELF_DISPATCH:", "actions: write")
             if key not in text
         ]
-        if name == "youtube-recorder.yml" and "setup_potoken.sh" not in text:
-            missing.append("setup_potoken.sh（PO Token provider）")
+        if name == "youtube-recorder.yml":
+            for extra in ("setup_potoken.sh", "setup_warp.sh"):
+                if extra not in text:
+                    missing.append(f"{extra}（YouTubeのアクセス経路）")
         if missing:
             print(f"  [FAIL] {name}: 不足 {missing}")
             ok = False

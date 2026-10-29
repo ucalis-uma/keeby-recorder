@@ -1,0 +1,86 @@
+name: YouTube Access Check
+
+# 週1回、本番と同じ経路（WARP + yt-dlp + PO Token）で YouTube に
+# アクセスできるかだけを確認する。
+#
+# 旧 cookie-check（毎時のログインCookie巡回）と cookie-canary（日次）は廃止した。
+#   理由1: ログイン済みCookieで /feed/* を巡回するのは scraper そのもので、
+#          セッション失効を早めている疑いがあった。
+#   理由2: Cookie を使わない経路（WARP + android_vr/mweb + PO Token）に
+#          切り替えたため、Cookie の定期更新そのものが不要になった。
+#
+# ここが失敗したら「録画経路が壊れた」ということなので、Issue を作って知らせる。
+
+on:
+  schedule:
+    # 毎週月曜 04:23 UTC（:00 は実行が集中するため避ける）
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: youtube-access-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup dependencies
+        run: bash setup_dependencies.sh
+
+      - name: Setup PO token provider (bgutil)
+        run: bash setup_potoken.sh
+
+      - name: Setup Cloudflare WARP
+        run: bash setup_warp.sh
+
+      - name: Probe YouTube access (same path as production)
+        env:
+          YOUTUBE_API_KEYS: ${{ secrets.YOUTUBE_API_KEYS }}
+          PROBE_ONLY: '1'
+          # 1080p の mp4 がある安定した動画。bot 壁の判定用（ライブである必要はない）。
+          TEST_LIVE_URL: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
+          YTDLP_PROXY: http://127.0.0.1:40000
+          YT_DLP_BIN: /usr/local/bin/yt-dlp
+          LOG_DIR: ${{ github.workspace }}/logs
+        run: .venv/bin/python recorder.py
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: access-check-logs
+          path: ${{ github.workspace }}/logs
+          retention-days: 14
+
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="YouTube access check failed"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -z "$existing" ]; then
+            body=$(printf 'The weekly YouTube access check failed. The production path (WARP + yt-dlp + PO token) can no longer reach YouTube.\n\nRun: %s/%s/actions/runs/%s\n\nLook at the `PROBE RESULT` table in the `access-check-logs` artifact (`recorder.log`).\n\nIf every client says `Sign in to confirm you'"'"'re not a bot`, the egress IP is blocked again. Options: re-check WARP, or move the recorder to a dedicated host.\n\ncc @%s' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY_OWNER")
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --assignee "$GITHUB_REPOSITORY_OWNER"
+          fi
+
+      - name: Close issue on recovery
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="YouTube access check failed"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$GITHUB_REPOSITORY" --comment "Recovered: the YouTube access probe succeeded."
+          fi
