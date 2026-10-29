@@ -269,13 +269,23 @@ check(
 )
 
 # ============================================================
-# 3-2. 自己ディスパッチ（連鎖が 1 回で止まらないこと）
+# 3-2. 自己ディスパッチ（連鎖が 1 回で止まらないこと／二重起動しないこと）
 # ============================================================
 # workflow_dispatch は schedule と同じ扱いにならない。chain=1 を渡さないと
 # 次 job が「監視0秒・WARPなし・自己ディスパッチなし」で起動して連鎖が切れる。
 class _FakeResp:
     status_code = 204
     text = ""
+
+
+QUEUED = []
+
+
+class _FakeQueuedResp:
+    status_code = 200
+
+    def json(self):
+        return {"workflow_runs": list(QUEUED)}
 
 
 captured = {}
@@ -287,20 +297,23 @@ def _fake_post(url, json=None, headers=None, timeout=None):
     return _FakeResp()
 
 
+def _fake_get(url, params=None, headers=None, timeout=None):
+    return _FakeQueuedResp()
+
+
 _prev_requests = sys.modules.get("requests")
-sys.modules["requests"] = types.SimpleNamespace(post=_fake_post)
+sys.modules["requests"] = types.SimpleNamespace(post=_fake_post, get=_fake_get)
+_prev_env = {
+    k: os.environ.get(k) for k in ("GITHUB_REPOSITORY", "GITHUB_TOKEN", "GITHUB_RUN_ID")
+}
 os.environ["GITHUB_REPOSITORY"] = "owner/repo"
 os.environ["GITHUB_TOKEN"] = "dummy"
+os.environ["GITHUB_RUN_ID"] = "999"
 _prev_self, _prev_file = recorder.SELF_DISPATCH, recorder.SELF_WORKFLOW_FILE
 recorder.SELF_DISPATCH = True
 recorder.SELF_WORKFLOW_FILE = "youtube-recorder.yml"
-_ok = REAL_DISPATCH("test")
-recorder.SELF_DISPATCH, recorder.SELF_WORKFLOW_FILE = _prev_self, _prev_file
-if _prev_requests is None:
-    sys.modules.pop("requests", None)
-else:
-    sys.modules["requests"] = _prev_requests
 
+_ok = REAL_DISPATCH("test")
 check("自己ディスパッチが成功する", _ok is True, _ok)
 check(
     "自己ディスパッチが chain=1 を渡す",
@@ -312,6 +325,23 @@ check(
     str(captured.get("url", "")).endswith("/dispatches"),
     captured.get("url"),
 )
+
+# すでに待機中の run があれば起動しない（待機列が無限に伸びるのを防ぐ）
+captured.clear()
+QUEUED.append({"id": 1234})
+_ok2 = REAL_DISPATCH("test")
+check("待機中runがあれば二重起動しない", _ok2 is True and not captured, captured)
+
+recorder.SELF_DISPATCH, recorder.SELF_WORKFLOW_FILE = _prev_self, _prev_file
+for k, v in _prev_env.items():
+    if v is None:
+        os.environ.pop(k, None)
+    else:
+        os.environ[k] = v
+if _prev_requests is None:
+    sys.modules.pop("requests", None)
+else:
+    sys.modules["requests"] = _prev_requests
 
 
 # ============================================================

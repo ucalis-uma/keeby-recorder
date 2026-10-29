@@ -543,19 +543,44 @@ def maybe_dispatch_next(reason):
         )
         return False
     url = f"https://api.github.com/repos/{repo}/actions/workflows/{SELF_WORKFLOW_FILE}/dispatches"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
     try:
         import requests
+
+        # 二重ディスパッチ防止。この関数は「ライブ検知時」と「終了時」の2回呼ばれる。
+        # 既に待機中の run があるなら起動しない（待機列が無限に伸びるのを防ぐ）。
+        try:
+            own_id = os.environ.get("GITHUB_RUN_ID", "")
+            res = requests.get(
+                f"https://api.github.com/repos/{repo}/actions/workflows/{SELF_WORKFLOW_FILE}/runs",
+                params={"status": "queued", "per_page": 20},
+                headers=headers,
+                timeout=20,
+            )
+            if res.status_code == 200:
+                pending = [
+                    r
+                    for r in (res.json().get("workflow_runs") or [])
+                    if str(r.get("id")) != own_id
+                ]
+                if pending:
+                    logger.info(f"次の監視jobは既に待機中です（{reason}）。")
+                    return True
+        except Exception as e:
+            logger.warning(
+                f"待機中runの確認に失敗（そのまま起動します）: {type(e).__name__}: {e}"
+            )
 
         # chain=1 を渡す。workflow_dispatch は schedule と同じ扱いにならないため、
         # これが無いと次 job が「1回だけ・WARPなし・連鎖なし」で起動してしまう。
         res = requests.post(
             url,
             json={"ref": ref, "inputs": {"chain": "1"}},
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
+            headers=headers,
             timeout=30,
         )
         if res.status_code in (201, 204):
@@ -928,6 +953,9 @@ def execute_scripts(live_url, cookies_file=None, api_manager=None):
             strategies = [
                 (name, cmd[:1] + ["--live-from-start"] + cmd[1:]) for name, cmd in strategies
             ]
+            # DVR を持たない配信の最後の逃げ道。ライブ端から録る（端で403になる
+            # 可能性はあるが、何も録れないよりはよい）。
+            strategies.append(("ライブ端（DVRなし）", make_video_cmd(out_template)))
         return strategies
 
     video_id = extract_video_id(live_url)

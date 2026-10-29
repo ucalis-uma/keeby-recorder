@@ -322,7 +322,10 @@ cron が一度も来ないまま終わる。これが「昨日配信があった
    - 監視時間の終了時とライブ検知時に、REST API で `workflow_dispatch` を叩いて次 job を起動する。
    - cron が何時間来なくても監視が途切れない。cron は「連鎖が切れたときの保険」になる。
    - 必要な権限は `permissions: actions: write`。`GITHUB_TOKEN` を env で渡す。
-   - 同時実行は `concurrency` で1本に制限されるため、pending は最新1件に集約される。
+   - **`inputs.chain=1` を必ず渡す**。`workflow_dispatch` は `schedule` と同じ扱いにならないため、
+     これが無いと次 job が「監視0秒・WARPなし・自己ディスパッチなし」で起動し、連鎖が1回で切れる（実際に切れていた）。
+   - **待機中の run があれば起動しない**。検知時と終了時の2回呼ぶため、dedupe しないと
+     待機列が延々と伸びる（`status=queued` を確認してから dispatch する）。
 
 3. **ライブ検知を低コスト化**（`find_live_video_id`）
    - `search.list(eventType=live)` は 100 units/回。5分ポーリングでは1日でquotaを食い潰す。
@@ -346,8 +349,8 @@ cron が一度も来ないまま終わる。これが「昨日配信があった
 ### 13-3. 動作確認
 
 - `python check_all.py` が `workflow_env` を含めて全PASS。
-- `test_recorder_logic.py` の21件（監視ループ、quotaフェイルオーバー、終了コード3/4/5、
-  単発モード、セグメント継続、`--live-from-start` の有無）が全PASS。
+- `test_recorder_logic.py` の25件（監視ループ、quotaフェイルオーバー、終了コード3/4/5、
+  単発モード、セグメント継続、`--live-from-start` の有無、自己ディスパッチの `chain=1` と dedupe）が全PASS。
 
 ### 13-4. 残る制約
 
@@ -497,6 +500,7 @@ WARP を入れた直後の run #158 (`40922075004`, 2026-10-29 17:31〜18:06 UTC
 
 - 先頭セグメントは常に `--live-from-start`（DVR の先頭から）。端に触れないので 403 が出ない
 - 2セグメント目以降は重複するため付けない
+- それでも何も録れない場合だけ、最後の逃げ道として `--live-from-start` なし（ライブ端）を1回試す
 - `HTTP Error 403` を Cookie 失効の判定材料から外した（未配信セグメントでも出るため）
 - 試行順を実測に合わせて `匿名 → android_vr → mweb → tv_simply → web_safari → web_embedded → tv → 緩い形式 → Cookie` に変更
   - 既定クライアントが WARP 下で 25分連続して安定していたのが理由
