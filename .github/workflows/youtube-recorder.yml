@@ -138,6 +138,13 @@ jobs:
         # （PEP 668 のためシステム pip は使わない）。
         # COOKIES_FILE が存在しない場合 recorder.py 側で警告して継続する。
         run: .venv/bin/python recorder.py
+      - name: Dump PO token provider log
+        # 失敗調査用。provider が PoToken を生成できているか確認する。
+        if: always()
+        run: |
+          docker ps -a --filter name=bgutil-provider || true
+          docker logs --tail 40 bgutil-provider 2>&1 || true
+
       - name: Warn on YouTube cookie errors
         # 録画は Cookie なし再試行で成功する場合もあるため、ここでは警告に留める。
         # 実際の失敗は recorder.py の終了コード（3/4/5）で job を赤くする。

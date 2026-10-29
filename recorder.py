@@ -1122,11 +1122,14 @@ def probe_clients(live_url, cookies_file=None):
         return cmd
 
     candidates = [
-        ("匿名", {}),
+        ("android_vr", {"extra": ["--extractor-args", "youtube:player_client=android_vr"]}),
+        ("web", {"extra": ["--extractor-args", "youtube:player_client=web"]}),
+        ("mweb", {"extra": ["--extractor-args", "youtube:player_client=mweb"]}),
+        ("tv_simply", {"extra": ["--extractor-args", "youtube:player_client=tv_simply"]}),
         ("web_safari", {"extra": ["--extractor-args", "youtube:player_client=web_safari"]}),
         ("web_embedded", {"extra": ["--extractor-args", "youtube:player_client=web_embedded"]}),
-        ("android_vr", {"extra": ["--extractor-args", "youtube:player_client=android_vr"]}),
         ("tv", {"extra": ["--extractor-args", "youtube:player_client=tv"]}),
+        ("匿名", {}),
     ]
     if cookies_file:
         candidates.append(("Cookie", {"use_cookies": True}))
