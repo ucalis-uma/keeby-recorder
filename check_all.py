@@ -59,7 +59,7 @@ def check_runtime_imports():
             "TEST_LIVE_URL", "TEST_MAX_SECONDS", "SKIP_UPLOAD",
             "WATCH_MAX_SECONDS", "POLL_INTERVAL", "SELF_DISPATCH",
             "MAX_DOWNLOAD_BYTES", "PROBE_ONLY", "MAX_SEGMENTS",
-            "YT_DLP_PLUGIN_DIR", "ytdlp_base_cmd",
+            "YT_DLP_PLUGIN_DIR", "YTDLP_PROXY", "ytdlp_base_cmd",
             "maybe_dispatch_next", "find_live_video_id",
             "extract_video_id", "get_video_state", "derive_stem",
             "concat_segments", "probe_clients",

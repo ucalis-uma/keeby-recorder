@@ -149,6 +149,8 @@ YT_DLP_PLUGIN_DIR = os.environ.get(
     "YT_DLP_PLUGIN_DIR",
     os.path.join(os.path.expanduser("~"), ".config", "yt-dlp", "plugins"),
 )
+# 出口IPを変えたいとき（WARP 等）に HTTP プロキシを指定する
+YTDLP_PROXY = os.environ.get("YTDLP_PROXY", "").strip()
 RCLONE_BIN = os.environ.get("RCLONE_BIN", "rclone")
 RCLONE_REMOTE = os.environ.get("RCLONE_REMOTE", "gdrive")
 GDRIVE_VIDEO_DEST = os.environ.get("GDRIVE_VIDEO_DEST", f"{RCLONE_REMOTE}:/keeby/videos")
@@ -256,10 +258,12 @@ def format_bytes(size):
 
 
 def ytdlp_base_cmd():
-    """yt-dlp の共通引数。PO Token plugin のディレクトリを明示的に渡す。"""
+    """yt-dlp の共通引数。PO Token plugin とプロキシを明示的に渡す。"""
     cmd = [YT_DLP_BIN]
     if os.path.isdir(YT_DLP_PLUGIN_DIR):
         cmd += ["--plugin-dirs", YT_DLP_PLUGIN_DIR]
+    if YTDLP_PROXY:
+        cmd += ["--proxy", YTDLP_PROXY]
     return cmd
 
 
