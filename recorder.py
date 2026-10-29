@@ -650,21 +650,6 @@ def _is_cookie_error(text):
     return any(m in text for m in markers)
 
 
-def _strip_cookie_args(cmd):
-    """コマンドラインから --cookies <path> を取り除く。"""
-    out = []
-    skip_next = False
-    for arg in cmd:
-        if skip_next:
-            skip_next = False
-            continue
-        if arg == "--cookies":
-            skip_next = True
-            continue
-        out.append(arg)
-    return out
-
-
 # ============================================================
 # メイン録画処理（VPS版 execute_scripts を1回完結版に）
 # ============================================================
@@ -696,61 +681,73 @@ def execute_scripts(live_url, cookies_file=None):
     )
 
     # --- 動画ダウンロード（ウォッチドッグ付き） ---
-    # テスト時は通常の動画URLでも落とせるよう --live-from-start を外す（本番は付与）。
-    is_test = bool(TEST_LIVE_URL)
-    video_cmd = [YT_DLP_BIN]
-    if not is_test:
-        video_cmd.append("--live-from-start")
-    video_cmd += [
-        "--retries", "infinite",
-        "--fragment-retries", "infinite",
-        "--socket-timeout", "30",
-        "--no-playlist",
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "-o", os.path.join(DOWNLOAD_DIR, "%(title)s [%(id)s].%(ext)s"),
-    ]
-    if cookies_file:
-        video_cmd += ["--cookies", cookies_file]
-    video_cmd.append(live_url)
+    # 失敗したら yt-dlp の認証方式を変えて順に再試行する。
+    # YouTube はデータセンターIPからのライブ取得に bot 判定を出しやすく、
+    # Cookie だけでは通らないことがある（player_client を変えると通る場合がある）。
 
-    video_exit = run_with_watchdog(
-        video_cmd,
-        DOWNLOAD_DIR,
-        label="動画DL",
-        max_seconds=TEST_MAX_SECONDS,
-        max_bytes=MAX_DOWNLOAD_BYTES,
+    def make_video_cmd(use_cookies=True, extra=None, format_expr=None):
+        cmd = [YT_DLP_BIN]
+        # テスト時は通常の動画URLでも落とせるよう --live-from-start を外す（本番は付与）。
+        if not TEST_LIVE_URL:
+            cmd.append("--live-from-start")
+        cmd += [
+            "--retries", "infinite",
+            "--fragment-retries", "infinite",
+            "--socket-timeout", "30",
+            "--no-playlist",
+            "-f", format_expr or "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "-o", os.path.join(DOWNLOAD_DIR, "%(title)s [%(id)s].%(ext)s"),
+        ]
+        if extra:
+            cmd += extra
+        if use_cookies and cookies_file:
+            cmd += ["--cookies", cookies_file]
+        cmd.append(live_url)
+        return cmd
+
+    # (ログ用ラベル, 引数) の順に試す。1回目以外は前回が失敗したときだけ実行する。
+    strategies = [("既定", make_video_cmd())]
+    strategies.append(("緩いフォーマット", make_video_cmd(format_expr="bv*+ba/b")))
+    if cookies_file:
+        strategies.append(("Cookieなし", make_video_cmd(use_cookies=False)))
+    strategies.append(
+        (
+            "web_safari",
+            make_video_cmd(extra=["--extractor-args", "youtube:player_client=web_safari"]),
+        )
+    )
+    strategies.append(
+        ("tv", make_video_cmd(extra=["--extractor-args", "youtube:player_client=tv"]))
+    )
+    strategies.append(
+        (
+            "android_vr",
+            make_video_cmd(extra=["--extractor-args", "youtube:player_client=android_vr"]),
+        )
     )
 
-    # --- Cookie 起因の失敗なら Cookie なしで1回だけ再試行 ---
-    # cookie-check.yml / cookie-canary.yml で失効を監視しているが、
-    # 失効直後や bot 判定でも「Cookieなしなら通る」ことがあるため保険を張る。
-    if video_exit not in (0, -1, -2, -3) and get_dir_size(DOWNLOAD_DIR) == 0 and cookies_file:
-        stderr_text = _read_text(os.path.join(LOG_DIR, "ytdlp-video-stderr.log"))
-        if _is_cookie_error(stderr_text):
-            logger.warning("Cookie が無効/拒否されました。Cookie なしで再試行します。")
-            nolog_cmd = _strip_cookie_args(video_cmd)
-            video_exit = run_with_watchdog(
-                nolog_cmd,
-                DOWNLOAD_DIR,
-                label="動画DLcookieなし",
-                max_seconds=TEST_MAX_SECONDS,
-            )
-
-    # --- 厳格フォーマットで失敗したら緩い指定で1回だけ再試行 ---
-    # Shorts 等で mp4/m4a ペアが存在しない場合の救済。テスト打ち切り(-2)・
-    # 停滞打ち切り(-1)・正常終了(0)の場合は再試行しない。
-    if video_exit not in (0, -1, -2, -3) and get_dir_size(DOWNLOAD_DIR) == 0:
-        logger.warning(
-            f"動画DLがコード {video_exit} で失敗。フォーマット指定を緩めて再試行します。"
-        )
-        retry_cmd = [c for c in video_cmd if c != "--live-from-start"]
-        for i, c in enumerate(retry_cmd):
-            if c == "-f":
-                retry_cmd[i + 1] = "bv*+ba/b"
+    video_exit = None
+    for index, (name, cmd) in enumerate(strategies):
+        if index > 0:
+            if video_exit in (0, -1, -2, -3) or get_dir_size(DOWNLOAD_DIR) > 0:
                 break
+            logger.warning(
+                f"録画に失敗（コード {video_exit}）。別の方式で再試行します: {name}"
+            )
         video_exit = run_with_watchdog(
-            retry_cmd, DOWNLOAD_DIR, label="動画DL再試行", max_seconds=TEST_MAX_SECONDS
+            cmd,
+            DOWNLOAD_DIR,
+            label=f"video-{index}",
+            max_seconds=TEST_MAX_SECONDS,
+            max_bytes=MAX_DOWNLOAD_BYTES,
         )
+        if index == 0 and video_exit not in (0, -1, -2, -3):
+            stderr_text = _read_text(os.path.join(LOG_DIR, f"ytdlp-video-{index}-stderr.log"))
+            if _is_cookie_error(stderr_text):
+                logger.error(
+                    "Cookie が失効/拒否されています。COOKIES_TXT の更新が必要です"
+                    "（player_client を変えて再試行を続けます）。"
+                )
 
     # --- 動画DL終了後にコメントDLも終了させる ---
     logger.info("動画DLが終了。コメント取得プロセスを終了...")
