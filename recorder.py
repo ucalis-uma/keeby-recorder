@@ -118,6 +118,13 @@ try:
 except ValueError:
     TEST_MAX_SECONDS = 0
 SKIP_UPLOAD = os.environ.get("SKIP_UPLOAD", "") == "1"
+# MAX_DOWNLOAD_GB: テスト時にダウンロード量を GB で打ち切る（0=無制限。本番は0）
+try:
+    MAX_DOWNLOAD_BYTES = int(
+        float(os.environ.get("MAX_DOWNLOAD_GB", "0") or "0") * (1024 ** 3)
+    )
+except ValueError:
+    MAX_DOWNLOAD_BYTES = 0
 
 BASE_DIR = os.environ.get("KEEBY_BASE_DIR", os.getcwd())
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
@@ -431,12 +438,13 @@ def _log_stderr_tail(stderr_path, label):
         logger.error(f"[{label}] stderr が空でした ({stderr_path})")
 
 
-def run_with_watchdog(command, watch_dir, label="process", max_seconds=0):
+def run_with_watchdog(command, watch_dir, label="process", max_seconds=0, max_bytes=0):
     """
     子プロセスを起動し、watch_dir のサイズを定期監視。
     STALL_TIMEOUT 秒間サイズが変化しなければプロセスを強制終了（配信終了とみなす）。
     旧VPS版と同一ロジック。max_seconds > 0 のときはテスト用にその秒数で打ち切る。
-    戻り値: プロセス終了コード（停滞打ち切り時は -1、時間打ち切り時は -2）。
+    max_bytes > 0 のときはダウンロード量がその値に達したら打ち切る（容量テスト用）。
+    戻り値: 終了コード（停滞打ち切り=-1、時間打ち切り=-2、サイズ上限=-3）。
     yt-dlp の stdout/stderr は LOG_DIR/ytdlp-<label>-*.log に保存し、
     失敗時は stderr 末尾をこのログにも転記する（原因特定用）。
     """
@@ -474,7 +482,11 @@ def run_with_watchdog(command, watch_dir, label="process", max_seconds=0):
     last_change_time = time.time()
     start_time = time.time()
     # テスト時は短時間打ち切りのため監視間隔を短くする（本番は60秒のまま）
-    interval = min(10, WATCHDOG_CHECK_INTERVAL) if max_seconds > 0 else WATCHDOG_CHECK_INTERVAL
+    interval = (
+        min(10, WATCHDOG_CHECK_INTERVAL)
+        if (max_seconds > 0 or max_bytes > 0)
+        else WATCHDOG_CHECK_INTERVAL
+    )
 
     while proc.poll() is None:
         time.sleep(interval)
@@ -496,6 +508,27 @@ def run_with_watchdog(command, watch_dir, label="process", max_seconds=0):
             _close_logs()
             return -2
         current_size = get_dir_size(watch_dir)
+
+        if max_bytes > 0 and current_size >= max_bytes:
+            logger.info(
+                f"[{label}] サイズ上限 {format_bytes(max_bytes)} に到達"
+                f"（現在 {format_bytes(current_size)}）。SIGINTで停止します。"
+            )
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=300)  # ffmpeg結合の猶予
+            except subprocess.TimeoutExpired:
+                logger.warning(f"[{label}] 停止待ちタイムアウト。SIGKILLします。")
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    proc.wait()
+                except ProcessLookupError:
+                    pass
+            _close_logs()
+            return -3
 
         if current_size != last_size:
             elapsed = int(time.time() - last_change_time)
@@ -681,13 +714,17 @@ def execute_scripts(live_url, cookies_file=None):
     video_cmd.append(live_url)
 
     video_exit = run_with_watchdog(
-        video_cmd, DOWNLOAD_DIR, label="動画DL", max_seconds=TEST_MAX_SECONDS
+        video_cmd,
+        DOWNLOAD_DIR,
+        label="動画DL",
+        max_seconds=TEST_MAX_SECONDS,
+        max_bytes=MAX_DOWNLOAD_BYTES,
     )
 
     # --- Cookie 起因の失敗なら Cookie なしで1回だけ再試行 ---
     # cookie-check.yml / cookie-canary.yml で失効を監視しているが、
     # 失効直後や bot 判定でも「Cookieなしなら通る」ことがあるため保険を張る。
-    if video_exit not in (0, -1, -2) and get_dir_size(DOWNLOAD_DIR) == 0 and cookies_file:
+    if video_exit not in (0, -1, -2, -3) and get_dir_size(DOWNLOAD_DIR) == 0 and cookies_file:
         stderr_text = _read_text(os.path.join(LOG_DIR, "ytdlp-video-stderr.log"))
         if _is_cookie_error(stderr_text):
             logger.warning("Cookie が無効/拒否されました。Cookie なしで再試行します。")
@@ -702,7 +739,7 @@ def execute_scripts(live_url, cookies_file=None):
     # --- 厳格フォーマットで失敗したら緩い指定で1回だけ再試行 ---
     # Shorts 等で mp4/m4a ペアが存在しない場合の救済。テスト打ち切り(-2)・
     # 停滞打ち切り(-1)・正常終了(0)の場合は再試行しない。
-    if video_exit not in (0, -1, -2) and get_dir_size(DOWNLOAD_DIR) == 0:
+    if video_exit not in (0, -1, -2, -3) and get_dir_size(DOWNLOAD_DIR) == 0:
         logger.warning(
             f"動画DLがコード {video_exit} で失敗。フォーマット指定を緩めて再試行します。"
         )
@@ -790,6 +827,10 @@ def execute_scripts(live_url, cookies_file=None):
         logger.info("(ウォッチドッグにより停止 — 配信は正常に終了した可能性が高い)")
     elif video_exit == -2:
         logger.info("(テスト時間打ち切り — ドライラン正常終了)")
+    elif video_exit == -3:
+        logger.info(
+            f"(サイズ上限 {format_bytes(MAX_DOWNLOAD_BYTES)} で打ち切り — 容量テスト正常終了)"
+        )
 
     logger.info(f"========== 録画サイクル完了 (status={status}) ==========")
     return status
@@ -814,6 +855,10 @@ def main():
         logger.info(f"テストモード: TEST_MAX_SECONDS={TEST_MAX_SECONDS}秒")
     if SKIP_UPLOAD:
         logger.info("テストモード: SKIP_UPLOAD=1（Drive へ上げずローカル保持）")
+    if MAX_DOWNLOAD_BYTES > 0:
+        logger.info(
+            f"テストモード: ダウンロード上限 {format_bytes(MAX_DOWNLOAD_BYTES)}"
+        )
 
     if TEST_LIVE_URL:
         # テスト時は API 検知をスキップし、指定 URL を直接録画する。

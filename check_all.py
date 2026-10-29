@@ -58,7 +58,7 @@ def check_runtime_imports():
             "format_bytes", "datetime",
             "TEST_LIVE_URL", "TEST_MAX_SECONDS", "SKIP_UPLOAD",
             "WATCH_MAX_SECONDS", "POLL_INTERVAL", "SELF_DISPATCH",
-            "maybe_dispatch_next", "find_live_video_id",
+            "MAX_DOWNLOAD_BYTES", "maybe_dispatch_next", "find_live_video_id",
         },
         "twitch_recorder.py": {
             "TEST_TARGET_URL", "TEST_MAX_SECONDS", "SKIP_UPLOAD",

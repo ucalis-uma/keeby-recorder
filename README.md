@@ -206,6 +206,7 @@ YouTube 側：`Actions → YouTube Live Recorder → Run workflow` で以下を�
 | `test_live_url` | `https://www.youtube.com/watch?v=...`（適当なライブ/動画URL） | API 検知をスキップし直接録画 |
 | `test_max_seconds` | `90` | 90秒で打ち切り終了 |
 | `skip_upload` | `true` | Drive へ上げずローカル保持→artifact 保存 |
+| `max_download_gb` | `2.5` | 約2.5GBでダウンロードを打ち切る（0=無制限） |
 
 Twitch 側：`Actions → Twitch Live Recorder → Run workflow` で以下を指定
 
@@ -349,3 +350,26 @@ cron が一度も来ないまま終わる。これが「昨日配信があった
 - 監視jobが4時間で終わるため、job上限（350分）に近い長さの配信では、録画がタイムアウトで切れる可能性がある。その場合、次jobがライブを再検知して `--live-from-start` で頭から取り直す（重複はrcloneが同名上書き）。
 - 監視の連鎖が何らかの理由で切れた場合に備え、cron はそのまま残している（`5,20,35,50` / `12,27,42,57`）。
 - 60日ルール対策の `keepalive.yml` も従来どおり必要。
+
+### 13-5. Drive 保存の容量テスト（実配信で 2〜3GB）
+
+実際のライブ配信から 2〜3GB だけ取得し、Google Drive まで保存できるかを確認する手順。
+
+`Actions → YouTube Live Recorder → Run workflow` で以下を指定する。
+
+| input | 値 | 意味 |
+|---|---|---|
+| `test_live_url` | `https://www.youtube.com/channel/UC.../live` または `https://www.youtube.com/watch?v=...` | 配信中のURL。`/channel/<ID>/live` はライブへ自動転送される |
+| `test_max_seconds` | `0` | 時間ではなくサイズで打ち切る |
+| `skip_upload` | **false**（チェックしない） | 実際に Drive へアップロードする |
+| `max_download_gb` | `2.5` | 約2.5GBに達したら SIGINT で停止し、結合後にアップロード |
+
+- `test_max_seconds` と `max_download_gb` は併用でき、先に達した方で打ち切る。
+- サイズ上限で止めた場合は終了コード -3 として扱い、**失敗ではなく正常な打ち切り**（そのままアップロードへ進む）。
+- アップロード先は Variables の `GDRIVE_VIDEO_DEST`（例 `gdrive:/keeby/videos`）。
+- 成功するとログに `アップロード完了 & ローカル削除済み。` と `status=ok` が出る。
+- Drive が満杯なら `storageQuotaExceeded` を検出して exit 4 になり、
+  録画は `youtube-fallback-recording` として artifact に3日間退避される。
+
+> 2.5GB の取得には回線・配信ビットレートにより数十分かかる。
+> 途中経過は `recorder.log` の `[動画DL] DL中... サイズ:` で確認できる。
