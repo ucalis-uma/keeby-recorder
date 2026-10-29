@@ -281,7 +281,7 @@ Cookie を使って `/feed/subscriptions` や `/feed/history` を巡回してい
 
 ### 12-4. Cookie はもう必須ではない
 
-- 既定は「匿名（android_vr → mweb → tv_simply → …）→ 最後に Cookie」の順。
+- 既定は「匿名 → android_vr → mweb → tv_simply → … → 最後に Cookie」の順。
 - `COOKIES_TXT` は保険として残してあるが、更新しなくても録画は動く。
 - 更新する場合: Secrets の `COOKIES_TXT` を差し替え、
   `Actions → YouTube Access Check → Run workflow` で疎通確認する。
