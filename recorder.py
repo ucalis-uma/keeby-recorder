@@ -1150,6 +1150,25 @@ def probe_clients(live_url, cookies_file=None):
     logger.info("===== PROBE RESULT =====")
     for name, ok, detail in results:
         logger.info(f"  [{'OK' if ok else 'NG'}] {name:<14} {detail}")
+
+    # ライブが全滅しても、配信終了後の VOD なら保存できるか（後追いフォールバックの判断）
+    vod_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+    try:
+        res = subprocess.run(
+            ytdlp_base_cmd()
+            + ["--simulate", "--no-warnings", "--print", "%(id)s|%(duration)s", vod_url],
+            capture_output=True,
+            timeout=180,
+        )
+        vod_ok = res.returncode == 0
+        vod_detail = (
+            res.stdout.decode("utf-8", "replace").strip()
+            if vod_ok
+            else res.stderr.decode("utf-8", "replace").strip().splitlines()[-1][:160]
+        )
+    except subprocess.TimeoutExpired:
+        vod_ok, vod_detail = False, "timeout"
+    logger.info(f"  [{'OK' if vod_ok else 'NG'}] {'VOD':<14} {vod_detail}")
     logger.info("=======================")
 
     if not any(ok for _, ok, _ in results):
