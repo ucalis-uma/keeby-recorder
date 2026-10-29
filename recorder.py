@@ -143,6 +143,12 @@ DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 COMMENTS_DIR = os.path.join(BASE_DIR, "comments")
 
 YT_DLP_BIN = os.environ.get("YT_DLP_BIN", "yt-dlp")
+# yt-dlp のスタンドアロンバイナリは既定で ~/.config/yt-dlp/plugins を
+# 拾わないことがある（実測: Plugin directories: none）。明示的に渡す。
+YT_DLP_PLUGIN_DIR = os.environ.get(
+    "YT_DLP_PLUGIN_DIR",
+    os.path.join(os.path.expanduser("~"), ".config", "yt-dlp", "plugins"),
+)
 RCLONE_BIN = os.environ.get("RCLONE_BIN", "rclone")
 RCLONE_REMOTE = os.environ.get("RCLONE_REMOTE", "gdrive")
 GDRIVE_VIDEO_DEST = os.environ.get("GDRIVE_VIDEO_DEST", f"{RCLONE_REMOTE}:/keeby/videos")
@@ -247,6 +253,14 @@ def format_bytes(size):
             return f"{sign}{size:.1f}{unit}"
         size /= 1024
     return f"{sign}{size:.1f}TB"
+
+
+def ytdlp_base_cmd():
+    """yt-dlp の共通引数。PO Token plugin のディレクトリを明示的に渡す。"""
+    cmd = [YT_DLP_BIN]
+    if os.path.isdir(YT_DLP_PLUGIN_DIR):
+        cmd += ["--plugin-dirs", YT_DLP_PLUGIN_DIR]
+    return cmd
 
 
 def rescue_part_files(download_dir):
@@ -797,7 +811,7 @@ def execute_scripts(live_url, cookies_file=None, api_manager=None):
 
     # --- コメント取得をバックグラウンドで開始 ---
     # 出力は LOG_DIR に保存し、失敗時は末尾を転記する（動画DLと同様）。
-    comment_cmd = [YT_DLP_BIN, "--write-comments", "--skip-download", "--add-metadata",
+    comment_cmd = ytdlp_base_cmd() + ["--write-comments", "--skip-download", "--add-metadata",
                    "--no-playlist"]
     if cookies_file:
         comment_cmd += ["--cookies", cookies_file]
@@ -819,7 +833,7 @@ def execute_scripts(live_url, cookies_file=None, api_manager=None):
     #   exit 0 した。exit 0 = 配信終了と決めつけると録画が途切れる。）
 
     def make_video_cmd(out_template, use_cookies=False, extra=None, format_expr=None):
-        cmd = [YT_DLP_BIN]
+        cmd = ytdlp_base_cmd()
         # テスト時は通常の動画URLでも落とせるよう --live-from-start を外す（本番は付与）。
         if not TEST_LIVE_URL:
             cmd.append("--live-from-start")
@@ -1081,7 +1095,7 @@ def probe_clients(live_url, cookies_file=None):
     # PO Token provider のプラグインが読み込まれているか（導入後の確認用）
     try:
         res = subprocess.run(
-            [YT_DLP_BIN, "-v", "--simulate", "--no-warnings", live_url],
+            ytdlp_base_cmd() + ["-v", "--simulate", "--no-warnings", live_url],
             capture_output=True,
             timeout=180,
         )
@@ -1093,8 +1107,8 @@ def probe_clients(live_url, cookies_file=None):
         logger.warning(f"プラグイン確認に失敗: {type(e).__name__}: {e}")
 
     def cmd_for(use_cookies=False, extra=None):
-        cmd = [
-            YT_DLP_BIN, "--simulate", "--no-warnings", "--no-playlist",
+        cmd = ytdlp_base_cmd() + [
+            "--simulate", "--no-warnings", "--no-playlist",
             "--print", "%(id)s|%(live_status)s|%(format_id)s",
         ]
         if not TEST_LIVE_URL:
