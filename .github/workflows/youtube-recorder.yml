@@ -52,6 +52,11 @@ on:
         required: false
         default: '0'
         type: string
+      probe_only:
+        description: '経路の実測だけ行う（DLせず、どのplayer_clientが通るか確認）'
+        required: false
+        default: false
+        type: boolean
 
 # 同時実行させない（前の録画中に次のcronが走って二重録画＆runner枠の消費を防ぐ）
 permissions:
@@ -115,6 +120,7 @@ jobs:
           TEST_MAX_SECONDS: ${{ inputs.test_max_seconds }}
           SKIP_UPLOAD: ${{ inputs.skip_upload && '1' || '' }}
           MAX_DOWNLOAD_GB: ${{ inputs.max_download_gb }}
+          PROBE_ONLY: ${{ inputs.probe_only && '1' || '' }}
           # --- 監視ループ設定（cronが15分間隔で来ない対策） ---
           # schedule 実行のみ 4時間ぶん監視し、終了時に次jobを自己起動する。
           # 手動実行は inputs.watch_seconds（既定0=1回だけ）。

@@ -32,6 +32,7 @@ cron が間引かれても監視が途切れない。
 """
 
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -125,6 +126,17 @@ try:
     )
 except ValueError:
     MAX_DOWNLOAD_BYTES = 0
+
+# PROBE_ONLY=1: ダウンロードせず、どの player_client なら通るかだけを検証する
+PROBE_ONLY = os.environ.get("PROBE_ONLY", "") == "1"
+# USE_COOKIES=1: Cookie を最優先で使う（既定は匿名→Cookieの順）。
+# 匿名で通れば Cookie の定期更新が不要になるため、既定は匿名優先。
+USE_COOKIES_FIRST = os.environ.get("USE_COOKIES", "") == "1"
+# 1回の録画で結合するセグメント数の上限（HLSの一時終端で切れた時に継ぎ足す）
+try:
+    MAX_SEGMENTS = max(1, int(os.environ.get("MAX_SEGMENTS", "30") or "30"))
+except ValueError:
+    MAX_SEGMENTS = 30
 
 BASE_DIR = os.environ.get("KEEBY_BASE_DIR", os.getcwd())
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
@@ -226,13 +238,15 @@ def get_dir_size(path):
 
 
 def format_bytes(size):
-    """バイト数を人間が読みやすい表記に変換（旧VPS版と同一）"""
+    """バイト数を人間が読みやすい表記に変換（負の差分にも対応）"""
     size = float(size)
+    sign = "-" if size < 0 else ""
+    size = abs(size)
     for unit in ["B", "KB", "MB", "GB"]:
         if size < 1024:
-            return f"{size:.1f}{unit}"
+            return f"{sign}{size:.1f}{unit}"
         size /= 1024
-    return f"{size:.1f}TB"
+    return f"{sign}{size:.1f}TB"
 
 
 def rescue_part_files(download_dir):
@@ -372,6 +386,120 @@ def check_live_status(api_manager, target_channel_id, use_search_fallback=False)
         logger.info(f"  search.list で確認（補助・100units）: {target_channel_id}")
         return search_live_video_id(api_manager, target_channel_id)
     return find_live_video_id(api_manager, target_channel_id)
+
+
+# ============================================================
+# セグメント継続（HLSの一時終端対策）
+# ============================================================
+# 2026-10-29 の実配信テストで、配信が続いているのに HLS が ENDLIST を返し、
+# yt-dlp が exit 0 で終了して録画が 1.6GB で途切れた。
+# 「exit 0 = 配信終了」と決めつけず、Data API で still live を確認して継ぎ足す。
+VIDEO_ID_URL_RE = re.compile(r"(?:[?&]v=|youtu\.be/|/shorts/)([A-Za-z0-9_-]{11})")
+VIDEO_ID_BRACKET_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
+MEDIA_EXTS = (".mp4", ".mkv", ".webm", ".ts", ".flv", ".m4a")
+
+
+def extract_video_id(url):
+    """URL から動画IDを取り出す（取れなければ None）。"""
+    m = VIDEO_ID_URL_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def get_video_state(api_manager, video_id):
+    """(title, is_live) を返す。判定できなければ (None, None)。
+
+    videos.list は 1 unit。player API を叩かないので bot 判定の材料にならない。
+    """
+    if api_manager is None or not video_id:
+        return None, None
+    try:
+        def _call(yt):
+            return yt.videos().list(
+                part="snippet,liveStreamingDetails", id=video_id, maxResults=1
+            ).execute()
+
+        resp = api_manager.call(_call, f"videos.list({video_id})")
+    except Exception as e:
+        logger.warning(f"ライブ状態の取得に失敗: {type(e).__name__}: {e}")
+        return None, None
+
+    items = resp.get("items") or []
+    if not items:
+        return None, None
+    item = items[0]
+    details = item.get("liveStreamingDetails") or {}
+    is_live = bool(details.get("actualStartTime")) and not details.get("actualEndTime")
+    return (item.get("snippet") or {}).get("title"), is_live
+
+
+def _media_files(directory):
+    out = []
+    for name in os.listdir(directory):
+        if name.endswith(".part") or name.endswith(".ytdl"):
+            continue
+        if os.path.splitext(name)[1].lower() in MEDIA_EXTS:
+            out.append(name)
+    return out
+
+
+def derive_stem(directory):
+    """最初のセグメントのファイル名から拡張子を除いた stem を返す。"""
+    files = _media_files(directory)
+    if not files:
+        return None
+    files.sort(key=lambda n: os.path.getsize(os.path.join(directory, n)), reverse=True)
+    return os.path.splitext(files[0])[0]
+
+
+def concat_segments(directory, stem):
+    """stem + stem part02... を ffmpeg で1本に結合する。失敗時は None（元は保持）。"""
+    files = _media_files(directory)
+    first = [f for f in files if os.path.splitext(f)[0] == stem]
+    parts = sorted(
+        f for f in files if os.path.splitext(f)[0].startswith(stem + " part")
+    )
+    if not first or not parts:
+        return None
+
+    ordered = first[:1] + parts
+    ext = os.path.splitext(ordered[0])[1]
+    merged = stem + ".merged" + ext
+    list_path = os.path.join(directory, "_concat.txt")
+
+    with open(list_path, "w", encoding="utf-8") as f:
+        for name in ordered:
+            f.write("file '" + name.replace("'", "'\\''") + "'\n")
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+        "-f", "concat", "-safe", "0", "-i", "_concat.txt",
+        "-c", "copy", merged,
+    ]
+    logger.info(f"セグメントを結合します: {len(ordered)}本 → {merged}")
+    try:
+        res = subprocess.run(
+            cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+    except FileNotFoundError:
+        logger.error("ffmpeg が見つからないため結合できません（セグメントは保持）。")
+        return None
+
+    if res.returncode != 0:
+        out = (res.stdout or b"").decode("utf-8", "replace")[-1000:]
+        logger.error(f"結合に失敗しました（セグメントは保持）: {out}")
+        return None
+
+    for name in ordered:
+        try:
+            os.remove(os.path.join(directory, name))
+        except OSError:
+            pass
+    try:
+        os.remove(list_path)
+    except OSError:
+        pass
+    logger.info(f"結合完了: {merged}")
+    return merged
 
 
 # ============================================================
@@ -532,9 +660,13 @@ def run_with_watchdog(command, watch_dir, label="process", max_seconds=0, max_by
 
         if current_size != last_size:
             elapsed = int(time.time() - last_change_time)
+            delta = current_size - last_size
+            delta_text = (
+                f"+{format_bytes(delta)}" if delta >= 0 else format_bytes(delta)
+            )
             logger.info(
                 f"[{label}] DL中... サイズ: {format_bytes(current_size)} "
-                f"(+{format_bytes(current_size - last_size)} / {elapsed}秒)"
+                f"({delta_text} / {elapsed}秒)"
             )
             last_size = current_size
             last_change_time = time.time()
@@ -653,7 +785,7 @@ def _is_cookie_error(text):
 # ============================================================
 # メイン録画処理（VPS版 execute_scripts を1回完結版に）
 # ============================================================
-def execute_scripts(live_url, cookies_file=None):
+def execute_scripts(live_url, cookies_file=None, api_manager=None):
     """録画〜アップロードを1回実行する。
 
     戻り値: "ok" / "upload_failed" / "download_failed" / "no_data"
@@ -680,12 +812,13 @@ def execute_scripts(live_url, cookies_file=None):
         comment_cmd, stdout=comment_f_out, stderr=comment_f_err, start_new_session=True
     )
 
-    # --- 動画ダウンロード（ウォッチドッグ付き） ---
-    # 失敗したら yt-dlp の認証方式を変えて順に再試行する。
-    # YouTube はデータセンターIPからのライブ取得に bot 判定を出しやすく、
-    # Cookie だけでは通らないことがある（player_client を変えると通る場合がある）。
+    # --- 動画ダウンロード（ウォッチドッグ付き・セグメント継続） ---
+    # 1回の yt-dlp が「配信終了」と判断しても、Data API 上まだライブなら
+    # 続きを別セグメントとして録り、最後に ffmpeg で1本に結合する。
+    # （2026-10-29: HLS が一時的に ENDLIST を返し、配信継続中なのに 1.6GB で
+    #   exit 0 した。exit 0 = 配信終了と決めつけると録画が途切れる。）
 
-    def make_video_cmd(use_cookies=True, extra=None, format_expr=None):
+    def make_video_cmd(out_template, use_cookies=False, extra=None, format_expr=None):
         cmd = [YT_DLP_BIN]
         # テスト時は通常の動画URLでも落とせるよう --live-from-start を外す（本番は付与）。
         if not TEST_LIVE_URL:
@@ -696,7 +829,7 @@ def execute_scripts(live_url, cookies_file=None):
             "--socket-timeout", "30",
             "--no-playlist",
             "-f", format_expr or "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "-o", os.path.join(DOWNLOAD_DIR, "%(title)s [%(id)s].%(ext)s"),
+            "-o", out_template,
         ]
         if extra:
             cmd += extra
@@ -705,49 +838,137 @@ def execute_scripts(live_url, cookies_file=None):
         cmd.append(live_url)
         return cmd
 
-    # (ログ用ラベル, 引数) の順に試す。1回目以外は前回が失敗したときだけ実行する。
-    strategies = [("既定", make_video_cmd())]
-    strategies.append(("緩いフォーマット", make_video_cmd(format_expr="bv*+ba/b")))
-    if cookies_file:
-        strategies.append(("Cookieなし", make_video_cmd(use_cookies=False)))
-    strategies.append(
-        (
-            "web_safari",
-            make_video_cmd(extra=["--extractor-args", "youtube:player_client=web_safari"]),
-        )
-    )
-    strategies.append(
-        ("tv", make_video_cmd(extra=["--extractor-args", "youtube:player_client=tv"]))
-    )
-    strategies.append(
-        (
-            "android_vr",
-            make_video_cmd(extra=["--extractor-args", "youtube:player_client=android_vr"]),
-        )
-    )
+    def build_strategies(out_template):
+        """匿名 → クライアント変更 → 緩い形式 → 最後に Cookie、の順で試す。
 
-    video_exit = None
-    for index, (name, cmd) in enumerate(strategies):
-        if index > 0:
-            if video_exit in (0, -1, -2, -3) or get_dir_size(DOWNLOAD_DIR) > 0:
-                break
-            logger.warning(
-                f"録画に失敗（コード {video_exit}）。別の方式で再試行します: {name}"
+        Cookie は「あれば安定」ではなく、2026年は失効すると即エラーになる。
+        匿名で通るなら Cookie の定期更新が不要なので、既定は匿名優先。
+        """
+        strategies = []
+        if USE_COOKIES_FIRST and cookies_file:
+            strategies.append(
+                ("Cookie優先", make_video_cmd(out_template, use_cookies=True))
             )
-        video_exit = run_with_watchdog(
-            cmd,
-            DOWNLOAD_DIR,
-            label=f"video-{index}",
-            max_seconds=TEST_MAX_SECONDS,
-            max_bytes=MAX_DOWNLOAD_BYTES,
-        )
-        if index == 0 and video_exit not in (0, -1, -2, -3):
-            stderr_text = _read_text(os.path.join(LOG_DIR, f"ytdlp-video-{index}-stderr.log"))
-            if _is_cookie_error(stderr_text):
-                logger.error(
-                    "Cookie が失効/拒否されています。COOKIES_TXT の更新が必要です"
-                    "（player_client を変えて再試行を続けます）。"
+        strategies += [
+            ("匿名", make_video_cmd(out_template)),
+            (
+                "web_safari",
+                make_video_cmd(
+                    out_template,
+                    extra=["--extractor-args", "youtube:player_client=web_safari"],
+                ),
+            ),
+            (
+                "web_embedded",
+                make_video_cmd(
+                    out_template,
+                    extra=["--extractor-args", "youtube:player_client=web_embedded"],
+                ),
+            ),
+            (
+                "android_vr",
+                make_video_cmd(
+                    out_template,
+                    extra=["--extractor-args", "youtube:player_client=android_vr"],
+                ),
+            ),
+            (
+                "tv",
+                make_video_cmd(
+                    out_template,
+                    extra=["--extractor-args", "youtube:player_client=tv"],
+                ),
+            ),
+            ("緩いフォーマット", make_video_cmd(out_template, format_expr="bv*+ba/b")),
+        ]
+        if cookies_file and not USE_COOKIES_FIRST:
+            strategies.append(
+                ("Cookieフォールバック", make_video_cmd(out_template, use_cookies=True))
+            )
+        return strategies
+
+    video_id = extract_video_id(live_url)
+    started_at = time.time()
+    stem = None
+    segment = 1
+    video_exit = None
+
+    while True:
+        if segment == 1:
+            out_template = os.path.join(DOWNLOAD_DIR, "%(title)s [%(id)s].%(ext)s")
+        else:
+            # stem はタイトル由来なので、yt-dlp のテンプレート記号 % をエスケープする
+            out_template = os.path.join(
+                DOWNLOAD_DIR, f"{stem.replace('%', '%%')} part{segment:02d}.%(ext)s"
+            )
+
+        segment_exit = None
+        size_before = get_dir_size(DOWNLOAD_DIR)
+        for index, (name, cmd) in enumerate(build_strategies(out_template)):
+            if index > 0:
+                # 前のセグメントのファイルがあるため、増えたかどうかで判定する
+                if segment_exit in (0, -1, -2, -3) or get_dir_size(DOWNLOAD_DIR) > size_before:
+                    break
+                logger.warning(
+                    f"録画に失敗（コード {segment_exit}）。別の方式で再試行します: {name}"
                 )
+            logger.info(f"[segment {segment}] 試行: {name}")
+            segment_exit = run_with_watchdog(
+                cmd,
+                DOWNLOAD_DIR,
+                label=f"video-s{segment}-{index}",
+                max_seconds=TEST_MAX_SECONDS,
+                max_bytes=MAX_DOWNLOAD_BYTES,
+            )
+            if index == 0 and segment_exit not in (0, -1, -2, -3):
+                stderr_text = _read_text(
+                    os.path.join(LOG_DIR, f"ytdlp-video-s{segment}-{index}-stderr.log")
+                )
+                if _is_cookie_error(stderr_text):
+                    logger.warning(
+                        "Cookie が失効/拒否されています。COOKIES_TXT の更新が必要です"
+                        "（別方式で再試行を続けます）。"
+                    )
+
+        video_exit = segment_exit
+
+        if stem is None:
+            stem = derive_stem(DOWNLOAD_DIR)
+            if stem is None:
+                logger.error("動画ファイルが作成されませんでした。")
+                break
+
+        # --- 打ち切り系は継続しない ---
+        if video_exit in (-2, -3):
+            break
+        if segment >= MAX_SEGMENTS:
+            logger.info(f"セグメント上限 {MAX_SEGMENTS} に達しました。")
+            break
+        if TEST_MAX_SECONDS > 0 and time.time() - started_at >= TEST_MAX_SECONDS:
+            logger.info("テスト時間の上限に達しました。")
+            break
+        if MAX_DOWNLOAD_BYTES > 0 and get_dir_size(DOWNLOAD_DIR) >= MAX_DOWNLOAD_BYTES:
+            break
+
+        # --- 配信が続いているなら継ぎ足す（exit 0 を鵜呑みにしない） ---
+        vid = video_id
+        if not vid:
+            m = VIDEO_ID_BRACKET_RE.search(stem)
+            vid = m.group(1) if m else None
+        _, is_live = get_video_state(api_manager, vid)
+        if is_live is None:
+            logger.info("ライブ状態を確認できないため、このセグメントで終了します。")
+            break
+        if not is_live:
+            logger.info("配信は終了しています。録画を完了します。")
+            break
+
+        segment += 1
+        logger.info(
+            f"配信は継続中です（{format_bytes(get_dir_size(DOWNLOAD_DIR))}）。"
+            f"セグメント {segment} を開始します。"
+        )
+        time.sleep(3)
 
     # --- 動画DL終了後にコメントDLも終了させる ---
     logger.info("動画DLが終了。コメント取得プロセスを終了...")
@@ -788,6 +1009,11 @@ def execute_scripts(live_url, cookies_file=None):
         if part_files:
             logger.warning("未結合の .part/.ytdl が残っています。手動再結合を試みます。")
             rescue_part_files(DOWNLOAD_DIR)
+
+        # セグメントを1本に結合（失敗してもセグメントのままアップロードされる）
+        if stem:
+            concat_segments(DOWNLOAD_DIR, stem)
+            dl_size = get_dir_size(DOWNLOAD_DIR)
 
         if SKIP_UPLOAD:
             logger.info(
@@ -834,6 +1060,88 @@ def execute_scripts(live_url, cookies_file=None):
 
 
 # ============================================================
+# PROBE（経路の実測）
+# ============================================================
+def probe_clients(live_url, cookies_file=None):
+    """ダウンロードせず、どの player_client が通るかだけを検証する。
+
+    Cookie を捨てられるか / PO Token が必要かを、推測ではなく実測で決めるための
+    一時モード（PROBE_ONLY=1）。player API を数回叩くだけで済む。
+    """
+    logger.info("===== PROBE MODE =====")
+    logger.info(f"対象: {live_url}")
+
+    try:
+        res = subprocess.run([YT_DLP_BIN, "--version"], capture_output=True, timeout=60)
+        logger.info(f"yt-dlp: {res.stdout.decode('utf-8', 'replace').strip()}")
+    except Exception as e:
+        logger.error(f"yt-dlp の実行に失敗: {e}")
+        return EXIT_DOWNLOAD_ERROR
+
+    # PO Token provider のプラグインが読み込まれているか（導入後の確認用）
+    try:
+        res = subprocess.run(
+            [YT_DLP_BIN, "-v", "--simulate", "--no-warnings", live_url],
+            capture_output=True,
+            timeout=180,
+        )
+        text = (res.stdout + res.stderr).decode("utf-8", "replace")
+        for line in text.splitlines():
+            if "Plugin directories" in line or "PO Token Providers" in line:
+                logger.info(f"  {line.strip()}")
+    except Exception as e:
+        logger.warning(f"プラグイン確認に失敗: {type(e).__name__}: {e}")
+
+    def cmd_for(use_cookies=False, extra=None):
+        cmd = [
+            YT_DLP_BIN, "--simulate", "--no-warnings", "--no-playlist",
+            "--print", "%(id)s|%(live_status)s|%(format_id)s",
+        ]
+        if not TEST_LIVE_URL:
+            cmd.append("--live-from-start")
+        cmd += ["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"]
+        if extra:
+            cmd += extra
+        if use_cookies and cookies_file:
+            cmd += ["--cookies", cookies_file]
+        cmd.append(live_url)
+        return cmd
+
+    candidates = [
+        ("匿名", {}),
+        ("web_safari", {"extra": ["--extractor-args", "youtube:player_client=web_safari"]}),
+        ("web_embedded", {"extra": ["--extractor-args", "youtube:player_client=web_embedded"]}),
+        ("android_vr", {"extra": ["--extractor-args", "youtube:player_client=android_vr"]}),
+        ("tv", {"extra": ["--extractor-args", "youtube:player_client=tv"]}),
+    ]
+    if cookies_file:
+        candidates.append(("Cookie", {"use_cookies": True}))
+
+    results = []
+    for name, kwargs in candidates:
+        try:
+            res = subprocess.run(cmd_for(**kwargs), capture_output=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            results.append((name, False, "timeout"))
+            continue
+        ok = res.returncode == 0
+        out = res.stdout.decode("utf-8", "replace").strip().splitlines()
+        err = res.stderr.decode("utf-8", "replace").strip().splitlines()
+        detail = (out[-1] if (ok and out) else (err[-1] if err else ""))[:160]
+        results.append((name, ok, detail))
+
+    logger.info("===== PROBE RESULT =====")
+    for name, ok, detail in results:
+        logger.info(f"  [{'OK' if ok else 'NG'}] {name:<14} {detail}")
+    logger.info("=======================")
+
+    if not any(ok for _, ok, _ in results):
+        logger.error("全経路が NG。PO Token provider か Cookie が必要です。")
+        return EXIT_DOWNLOAD_ERROR
+    return 0
+
+
+# ============================================================
 # エントリポイント
 # ============================================================
 def main():
@@ -857,15 +1165,48 @@ def main():
             f"テストモード: ダウンロード上限 {format_bytes(MAX_DOWNLOAD_BYTES)}"
         )
 
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    os.makedirs(COMMENTS_DIR, exist_ok=True)
+
+    cookies_file = os.environ.get("COOKIES_FILE") or None
+    if cookies_file and not os.path.exists(cookies_file):
+        logger.warning(f"COOKIES_FILE が存在しません: {cookies_file}（Cookieなしで続行）")
+        cookies_file = None
+    if cookies_file:
+        logger.info(f"Cookie を利用可能: {cookies_file}（既定は匿名優先）")
+    else:
+        logger.info("Cookie なしで動作します。")
+
+    api_manager = None
+    if API_KEYS:
+        try:
+            api_manager = YouTubeAPIManager(API_KEYS)
+        except Exception as e:
+            logger.warning(f"API マネージャの初期化に失敗: {type(e).__name__}: {e}")
+
+    # --- PROBE モード（経路の実測だけして終了） ---
+    if PROBE_ONLY:
+        url = TEST_LIVE_URL
+        if not url and api_manager:
+            for channel_id in CHANNEL_IDS:
+                try:
+                    vid = find_live_video_id(api_manager, channel_id)
+                except Exception as e:
+                    logger.warning(f"ライブ検知に失敗 ({channel_id}): {e}")
+                    continue
+                if vid:
+                    url = f"https://www.youtube.com/watch?v={vid}"
+                    break
+        if not url:
+            url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+            logger.warning("ライブが見つからないため、固定動画で経路だけ検証します。")
+        return probe_clients(url, cookies_file)
+
     if TEST_LIVE_URL:
         # テスト時は API 検知をスキップし、指定 URL を直接録画する。
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        os.makedirs(COMMENTS_DIR, exist_ok=True)
-        cookies_file = os.environ.get("COOKIES_FILE")
-        if cookies_file and not os.path.exists(cookies_file):
-            logger.warning(f"COOKIES_FILE が存在しません: {cookies_file}（Cookieなしで続行）")
-            cookies_file = None
-        status = execute_scripts(TEST_LIVE_URL, cookies_file=cookies_file)
+        status = execute_scripts(
+            TEST_LIVE_URL, cookies_file=cookies_file, api_manager=api_manager
+        )
         logger.info("テスト録画が完了しました。")
         return 0 if status == "ok" else EXIT_DOWNLOAD_ERROR
 
@@ -873,20 +1214,7 @@ def main():
         logger.error("YOUTUBE_API_KEYS が未設定です。")
         return 2
 
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    os.makedirs(COMMENTS_DIR, exist_ok=True)
-
-    api_manager = YouTubeAPIManager(API_KEYS)
-
-    cookies_file = os.environ.get("COOKIES_FILE")
-    if cookies_file:
-        if os.path.exists(cookies_file):
-            logger.info(f"Cookie を使用します: {cookies_file}")
-        else:
-            logger.warning(f"COOKIES_FILE が存在しません: {cookies_file}（Cookieなしで続行）")
-            cookies_file = None
-    else:
-        logger.info("COOKIES_FILE 未設定（Cookieなしで続行）")
+    api_manager = api_manager or YouTubeAPIManager(API_KEYS)
 
     # --- 監視ループ ---
     # cron は 15分間隔では来ない（実測 中央値5.3時間）。job 内でポーリングし、
@@ -922,7 +1250,9 @@ def main():
             url = f"https://www.youtube.com/watch?v={live_id}"
             logger.info(f"ライブ配信を検知: {url}")
             maybe_dispatch_next("ライブ検知時（job上限で切れた場合の保険）")
-            status = execute_scripts(url, cookies_file=cookies_file)
+            status = execute_scripts(
+                url, cookies_file=cookies_file, api_manager=api_manager
+            )
             if status == "ok":
                 logger.info("録画とアップロードが完了しました。")
                 maybe_dispatch_next("録画完了後（監視を継続）")
