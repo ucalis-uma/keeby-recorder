@@ -67,6 +67,11 @@ on:
         required: false
         default: ''
         type: string
+      retry:
+        description: '内部用: 失敗時の自動再試行回数。手動では指定しない'
+        required: false
+        default: '0'
+        type: string
 
 # 同時実行させない（前の録画中に次のcronが走って二重録画＆runner枠の消費を防ぐ）
 permissions:
@@ -191,16 +196,40 @@ jobs:
             ${{ github.workspace }}/comments
           retention-days: 3
           if-no-files-found: warn
-      - name: Open issue on failure
-        # 失敗を通知する（放置で見逃さない）。
+      - name: Retry or open issue on failure
+        # 失敗したら cron を待たずに即座に次の監視 job を起動する。
+        # 連鎖が切れると次の cron まで（実測で数時間）検知できないため。
+        # 3回続けて失敗したときだけ Issue を作る（無限リトライで通知が埋もれるのを防ぐ）。
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RETRY: ${{ inputs.retry }}
+          TEST_URL: ${{ inputs.test_live_url }}
         run: |
           title="YouTube recorder job failed"
+          retry="${RETRY:-0}"
+          case "$retry" in ''|*[!0-9]*) retry=0 ;; esac
+          # テスト実行（URL指定）の失敗は本番監視を起動しない。
+          if [ -z "$TEST_URL" ] && [ "$retry" -lt 3 ]; then
+            next=$((retry + 1))
+            # 監視ループが既に次 job を自己ディスパッチしている場合は二重に起動しない。
+            # その場合は監視自体は続くので、再ディスパッチせず Issue で知らせる。
+            pending=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow youtube-recorder.yml --limit 50 \
+              --json databaseId,status \
+              --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID and (.status == \"queued\" or .status == \"in_progress\" or .status == \"waiting\" or .status == \"requested\" or .status == \"pending\"))] | length")
+            if [ "${pending:-0}" -gt 0 ]; then
+              echo "::notice::successor run already pending ($pending); monitoring continues, opening an issue"
+            else
+              echo "::warning::recorder failed (${retry}/3); re-dispatching immediately as retry ${next}"
+              if gh workflow run youtube-recorder.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f chain=1 -f retry="$next"; then
+                exit 0
+              fi
+              echo "::warning::re-dispatch failed; falling back to an issue"
+            fi
+          fi
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
           if [ -z "$existing" ]; then
-            body=$(printf 'The YouTube recorder job failed.\n\nCheck the run:\n%s/%s/actions/runs/%s\n\nLogs are attached as the `recorder-logs` artifact. If the error is a Drive quota error, the recording is saved as `youtube-fallback-recording` (3 days).\n\nCommon causes:\n- `storageQuotaExceeded`: Google Drive is full\n- `cookies are no longer valid` / `Sign in to confirm you` : update `COOKIES_TXT`\n- `quotaExceeded`: YouTube API quota (add another key to `YOUTUBE_API_KEYS`)\n\ncc @%s' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY_OWNER")
+            body=$(printf 'The YouTube recorder job failed and automatic retries are exhausted (attempt %s).\n\nCheck the run:\n%s/%s/actions/runs/%s\n\nLogs are attached as the `recorder-logs` artifact. If the error is a Drive quota error, the recording is saved as `youtube-fallback-recording` (3 days).\n\nCommon causes:\n- `storageQuotaExceeded`: Google Drive is full\n- `cookies are no longer valid` / `Sign in to confirm you` : update `COOKIES_TXT`\n- `quotaExceeded`: YouTube API quota (add another key to `YOUTUBE_API_KEYS`)\n\ncc @%s' "$((retry + 1))" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY_OWNER")
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --assignee "$GITHUB_REPOSITORY_OWNER"
           fi
       - name: Close issue on recovery

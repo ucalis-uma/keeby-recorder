@@ -275,7 +275,12 @@ Cookie を使って `/feed/subscriptions` や `/feed/history` を巡回してい
 ### 12-3. 録画時の失敗検知
 
 - `recorder.py` は API 連続失敗=3 / アップロード失敗=4 / 録画失敗=5 で終了する。
-- workflow は `failure()` で Issue を作成し、録画を artifact に退避する。
+- workflow は `failure()` で次の監視 job を即座に `workflow_dispatch` し、cron を待たずに
+  検知を再開する（`retry` 入力で回数を数え、3回連続で失敗したら Issue を作成する）。
+  - 監視ループが既に次 job を起動済みの失敗（アップロード失敗など）は二重起動せず、
+    監視を続けたまま Issue で知らせる。
+  - テスト実行（URL 指定）の失敗は本番監視を起動しない。
+- 録画は artifact に退避する。
 - ログの `cookies are no longer valid` は警告に留める（Cookie なし再試行で
   成功する場合があるため）。
 
@@ -341,7 +346,8 @@ cron が一度も来ないまま終わる。これが「昨日配信があった
    - 録画はできたが Drive へ上げられない → exit 4（ローカルは削除しない）
    - ライブを検知したが録画が0バイト → exit 5
    - workflow 側で `failure()` のとき録画を artifact（`youtube-fallback-recording` / `twitch-fallback-recording`、3日保持）へ退避する。
-   - 同様に `failure()` で Issue を作成し、次回 success で自動クローズする。
+   - 同様に `failure()` で Issue を作成し、次回 success で自動クローズする
+     （ただし直後の失敗は cron を待たず再ディスパッチして監視を継続し、3回連続失敗で Issue にする）。
 
 6. **Cookie起因の録画失敗は Cookie なしで1回再試行**
    - `cookies are no longer valid` / `Sign in to confirm you` 等を検出したら `--cookies` を外して再試行する。

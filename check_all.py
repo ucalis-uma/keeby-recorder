@@ -196,6 +196,17 @@ def check_workflow_runtime_env():
         for extra in ("chain:", "inputs.chain == '1'"):
             if extra not in text:
                 missing.append(f"{extra}（自己ディスパッチ連鎖）")
+        # 失敗時に cron（実測で数時間後）を待たずに次の監視 job を起動する仕組み。
+        # 再帰防止のため回数を inputs.retry で持ち、3回失敗で Issue にする。
+        for extra in (
+            "retry:",
+            "RETRY: ${{ inputs.retry }}",
+            "gh workflow run ",
+            "Retry or open issue on failure",
+            '-lt 3',
+        ):
+            if extra not in text:
+                missing.append(f"{extra}（失敗時の即時再ディスパッチ）")
         for key in ("WATCH_MAX_SECONDS:", "SELF_DISPATCH:"):
             line = next((ln for ln in text.splitlines() if ln.strip().startswith(key)), "")
             if "inputs.chain == '1'" not in line:
