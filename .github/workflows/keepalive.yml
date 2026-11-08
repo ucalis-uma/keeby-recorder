@@ -35,4 +35,15 @@ jobs:
           git config --global user.name  "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit --allow-empty -m "chore: keep-alive (prevent 60-day schedule disable)"
-          git push
+          # GitHub 側の一時的な 5xx で push が落ちることがある
+          # （2026-11-04 に "remote: Internal Server Error" で失敗）。
+          # 1回の失敗で通知を出さないよう、間隔を空けて3回まで再試行する。
+          for i in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "::warning::git push failed (attempt $i/3). retrying in $((i * 10))s..."
+            sleep $((i * 10))
+          done
+          echo "::error::git push failed after 3 attempts"
+          exit 1
