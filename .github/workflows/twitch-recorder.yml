@@ -147,7 +147,7 @@ jobs:
             # その場合は監視自体は続くので、再ディスパッチせず Issue で知らせる。
             pending=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow twitch-recorder.yml --limit 50 \
               --json databaseId,status \
-              --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID and (.status == \"queued\" or .status == \"in_progress\" or .status == \"waiting\" or .status == \"requested\" or .status == \"pending\"))] | length")
+              --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID and (.status == \"queued\" or .status == \"in_progress\" or .status == \"waiting\" or .status == \"requested\" or .status == \"pending\"))] | length") || pending=0
             if [ "${pending:-0}" -gt 0 ]; then
               echo "::notice::successor run already pending ($pending); monitoring continues, opening an issue"
             else
@@ -158,7 +158,7 @@ jobs:
               echo "::warning::re-dispatch failed; falling back to an issue"
             fi
           fi
-          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number // empty') || existing=""
           if [ -z "$existing" ]; then
             body=$(printf 'The Twitch recorder job failed and automatic retries are exhausted (attempt %s).\n\nCheck the run:\n%s/%s/actions/runs/%s\n\nLogs are attached as the `twitch-recorder-logs` artifact. If the error is a Drive quota error, the recording is saved as `twitch-fallback-recording` (3 days).\n\nCommon causes:\n- `storageQuotaExceeded`: Google Drive is full\n- yt-dlp error: check `ytdlp-twitch-stderr.log`\n\ncc @%s' "$((retry + 1))" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY_OWNER")
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --assignee "$GITHUB_REPOSITORY_OWNER"
